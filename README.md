@@ -11,7 +11,7 @@ This fork runs `ckai_bot.py`, a thin layer on Metaculus's template bot (`main.py
 
 ## Setup (GitHub Actions)
 
-1. **Secrets** (Settings → Secrets and variables → Actions → Secrets): `METACULUS_TOKEN` from your Metaculus bot account, and `OPENROUTER_API_KEY` from the Metaculus credits form or your own OpenRouter account. AskNews (`ASKNEWS_CLIENT_ID`, `ASKNEWS_SECRET`) is optional and free for registered bot makers.
+1. **Secrets** (Settings → Secrets and variables → Actions → Secrets): `METACULUS_TOKEN` from your Metaculus bot account, and `OPENROUTER_API_KEY` from the Metaculus credits form or your own OpenRouter account. AskNews is free for registered bot makers: add `ASKNEWS_API_KEY` (or the older `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET` pair) and set the `RESEARCHER_MODEL` variable to `asknews/news-summaries`. Sign-up steps are on Metaculus's resources page; renew each season.
 2. **Variables** (same page → Variables): `FORECASTER_MODELS`, for example one current model each from Anthropic, OpenAI and Google, written as `openrouter/<provider>/<model>` and comma-separated. Pick models your credits cover.
 3. **Enable Actions** on the Actions tab.
 4. **Dry run:** Actions → Test Bot → Run workflow, leaving "Dry run" ticked. Set "max questions" (for example 2) to keep a first run with new models or `REASONING_EFFORT` small. Download the `forecast-reports` artifact to read what it would have posted.
