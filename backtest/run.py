@@ -150,7 +150,10 @@ def done_counts(path: Path) -> dict[str, int]:
     counts: dict[str, int] = {}
     if path.exists():
         for line in path.read_text().splitlines():
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:  # a line cut short by a hard kill
+                continue
             if row.get("prediction") is not None:
                 counts[row["id"]] = counts.get(row["id"], 0) + 1
     return counts
@@ -258,7 +261,10 @@ def main() -> None:
         launch = (batch_dir / "launch.txt").read_text()
         if f"questions_sha256: {meta['sha256']}" not in launch:
             sys.exit("The question list changed since this batch started; start a new batch.")
-    (batch_dir / "question_ids.json").write_text(json.dumps([q["id"] for q in chosen]))
+    ids_path = batch_dir / "question_ids.json"
+    if ids_path.exists() and json.loads(ids_path.read_text()) != [q["id"] for q in chosen]:
+        sys.exit("--start/--limit differ from this batch's first launch.")
+    ids_path.write_text(json.dumps([q["id"] for q in chosen]))
     write_launch(batch_dir, meta, args)
 
     install_date_stub()

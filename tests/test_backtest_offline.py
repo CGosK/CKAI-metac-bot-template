@@ -218,3 +218,21 @@ def test_extremize():
     assert score.extremize(0.5, 2.0) == pytest.approx(0.5)
     assert score.extremize(0.7, 1.0) == pytest.approx(0.7)
     assert score.extremize(0.7, 2.0) > 0.8
+
+
+def test_clusters_join_groups_and_resolution_dates():
+    qs = [
+        {"id": "a", "group": "polymarket:x", "resolution_date": "2026-11-04"},
+        {"id": "b", "group": "polymarket:x", "resolution_date": "2026-11-05"},
+        {"id": "c", "group": "manifold:c", "resolution_date": "2026-11-05"},
+        {"id": "d", "group": "manifold:d", "resolution_date": "2026-09-01"},
+    ]
+    c = score.clusters(qs)
+    assert c["a"] == c["b"] == c["c"]
+    assert c["d"] != c["a"]
+
+
+def test_short_questions_are_listed():
+    qs, preds = scored_questions(10)
+    preds["q3"] = preds["q3"][:2]
+    assert score.analyse(qs, preds, predictions=5)["questions_with_fewer_predictions"] == ["q3"]

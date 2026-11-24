@@ -84,8 +84,29 @@ def load(batches: list[str]) -> tuple[dict, list[dict], dict[str, list[float]]]:
     return meta, [by_id[i] for i in preds], preds
 
 
+def clusters(questions: list[dict]) -> dict[str, str]:
+    """Each question's resampling cluster: questions that share a Polymarket
+    event group or a resolution date are joined (elections, Fed meetings and
+    month-end questions resolve together). Coarse on purpose, so intervals err
+    wide rather than narrow."""
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for q in questions:
+        parent[find("q:" + q["id"])] = find("g:" + q["group"])
+        parent[find("g:" + q["group"])] = find("d:" + q.get("resolution_date", q["id"]))
+    return {q["id"]: find("q:" + q["id"]) for q in questions}
+
+
 def folds_by_group(questions: list[dict]) -> dict[str, int]:
-    groups = sorted({q["group"] for q in questions})
+    """Fold per cluster id; questions carry their cluster in "cluster"."""
+    groups = sorted({q["cluster"] for q in questions})
     rng = random.Random(SEED)
     rng.shuffle(groups)
     return {g: i % FOLDS for i, g in enumerate(groups)}
@@ -109,7 +130,7 @@ def group_bootstrap(diffs: dict[str, float], groups: dict[str, str]) -> tuple[fl
         sample = [d for g in rng.choices(keys, k=len(keys)) for d in by_group[g]]
         stats.append(sum(sample) / len(sample))
     stats.sort()
-    lo, hi = stats[int(0.025 * BOOTSTRAP)], stats[int(0.975 * BOOTSTRAP) - 1]
+    lo, hi = stats[int(0.025 * BOOTSTRAP) - 1], stats[int(0.975 * BOOTSTRAP) - 1]
     below = sum(s <= 0 for s in stats) / BOOTSTRAP
     above = sum(s >= 0 for s in stats) / BOOTSTRAP
     return mean, lo, hi, min(1.0, 2 * min(below, above))
@@ -132,14 +153,18 @@ def subsample_brier(values: list[float], k: int, y: int) -> float:
 
 
 def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: int) -> dict:
-    full = [q for q in questions if len(preds[q["id"]]) >= predictions]
-    groups = {q["id"]: q["group"] for q in full}
+    full = [dict(q) for q in questions if len(preds[q["id"]]) >= predictions]
+    short = sorted(q["id"] for q in questions if len(preds[q["id"]]) < predictions)
+    cluster_of = clusters(full)
+    for q in full:
+        q["cluster"] = cluster_of[q["id"]]
+    groups = {q["id"]: q["cluster"] for q in full}
     y = {q["id"]: q["outcome"] for q in full}
     current = {q["id"]: statistics.median(preds[q["id"]][:predictions]) for q in full}
     base_brier = {i: brier(current[i], y[i]) for i in current}
 
     fold_of = folds_by_group(full)
-    fold = {q["id"]: fold_of[q["group"]] for q in full}
+    fold = {q["id"]: fold_of[q["cluster"]] for q in full}
     base_rate, extremized, alphas = {}, {}, []
     for f in range(FOLDS):
         train = [i for i in current if fold[i] != f]
@@ -168,7 +193,10 @@ def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: i
         pvalues[name] = p
     for name, p in holm(pvalues).items():
         comparisons[name]["p_holm"] = p
-        comparisons[name]["passes"] = p < 0.05 and comparisons[name]["gain"] > 0
+        # Adopted only if the Holm-adjusted p is under 0.05 and the interval excludes 0.
+        comparisons[name]["passes"] = (
+            p < 0.05 and comparisons[name]["gain"] > 0 and comparisons[name]["ci95"][0] > 0
+        )
 
     crowd = {q["id"]: q["crowd"] for q in full}
     bot_vs_crowd = group_bootstrap(
@@ -189,7 +217,7 @@ def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: i
     return {
         "questions_scored": n,
         "groups": len(set(groups.values())),
-        "questions_with_fewer_predictions": len(questions) - n,
+        "questions_with_fewer_predictions": short,
         "yes_rate": sum(y.values()) / n if n else None,
         "brier": {
             "bot_median": statistics.fmean(base_brier.values()) if n else None,
