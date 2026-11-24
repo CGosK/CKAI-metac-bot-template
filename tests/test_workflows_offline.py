@@ -26,6 +26,7 @@ REQUIRED = {
     "PARSER_MODEL": "vars",
     "PREDICTIONS_PER_QUESTION": "vars",
     "REASONING_EFFORT": "vars",
+    "FORECASTER_MAX_TOKENS": "vars",
 }
 
 

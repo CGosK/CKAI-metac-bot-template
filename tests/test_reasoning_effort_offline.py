@@ -22,6 +22,7 @@ import ckai_bot  # noqa: E402  (imported first so its .env load happens before t
 
 OPUS = "openrouter/anthropic/claude-test-opus"
 OTHER = "openrouter/openai/gpt-test"
+CANNED_FINISH_REASON = ["stop"]  # what the fake OpenRouter returns
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +33,7 @@ def env(monkeypatch):
     monkeypatch.setenv("SUMMARIZER_MODEL", "openrouter/test/summarizer")
     monkeypatch.setenv("PARSER_MODEL", "openrouter/test/parser")
     monkeypatch.delenv("REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("FORECASTER_MAX_TOKENS", raising=False)
     monkeypatch.delenv("PREDICTIONS_PER_QUESTION", raising=False)
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
@@ -57,7 +59,7 @@ def captured_requests(monkeypatch):
             "choices": [
                 {
                     "index": 0,
-                    "finish_reason": "stop",
+                    "finish_reason": CANNED_FINISH_REASON[0],
                     "message": {"role": "assistant", "content": "Probability: 40%"},
                 }
             ],
@@ -68,6 +70,7 @@ def captured_requests(monkeypatch):
         return httpx.Response(200, json=answer, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(http_handler.AsyncHTTPHandler, "post", fake_post)
+    CANNED_FINISH_REASON[0] = "stop"
     return requests
 
 
@@ -136,3 +139,100 @@ def test_request_body_without_setting(captured_requests):
     body = captured_requests[-1]["body"]
     assert "reasoning_effort" not in body
     assert body["temperature"] == 0.3
+
+
+# FORECASTER_MAX_TOKENS
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "High"])
+def test_default_cap_at_low_medium_high(monkeypatch, captured_requests, effort):
+    monkeypatch.setenv("REASONING_EFFORT", effort)
+    asyncio.run(ckai_bot.make_forecaster(OPUS).invoke("Will it rain?"))
+    body = captured_requests[-1]["body"]
+    assert body["max_tokens"] == ckai_bot.DEFAULT_MAX_TOKENS == 32000
+    assert body["reasoning_effort"] == effort.lower()
+
+
+@pytest.mark.parametrize("effort", [None, "none", "minimal", "xhigh", "max"])
+def test_no_default_cap_elsewhere(monkeypatch, captured_requests, effort):
+    if effort:
+        monkeypatch.setenv("REASONING_EFFORT", effort)
+    asyncio.run(ckai_bot.make_forecaster(OPUS).invoke("Will it rain?"))
+    assert "max_tokens" not in captured_requests[-1]["body"]
+
+
+@pytest.mark.parametrize(("effort", "sent"), [("high", "high"), ("max", "xhigh")])
+def test_setting_is_sent_with_effort(monkeypatch, captured_requests, effort, sent):
+    monkeypatch.setenv("REASONING_EFFORT", effort)
+    monkeypatch.setenv("FORECASTER_MAX_TOKENS", "100000")
+    asyncio.run(ckai_bot.make_forecaster(OPUS).invoke("Will it rain?"))
+    body = captured_requests[-1]["body"]
+    assert body["max_tokens"] == 100000
+    assert body["reasoning_effort"] == sent
+    assert "temperature" not in body
+
+
+def test_setting_without_effort_keeps_temperature(monkeypatch, captured_requests):
+    monkeypatch.setenv("FORECASTER_MAX_TOKENS", "8000")
+    asyncio.run(ckai_bot.make_forecaster(OPUS).invoke("Will it rain?"))
+    body = captured_requests[-1]["body"]
+    assert body["max_tokens"] == 8000
+    assert body["temperature"] == 0.3
+    assert "reasoning_effort" not in body
+
+
+@pytest.mark.parametrize(
+    ("effort", "minimum"),
+    [(None, 4000), ("none", 4000), ("minimal", 4445), ("low", 5000), ("medium", 8000),
+     ("high", 20000), ("xhigh", 80000), ("max", 80000)],
+)
+def test_minimum_leaves_room_for_the_answer(monkeypatch, effort, minimum):
+    if effort:
+        monkeypatch.setenv("REASONING_EFFORT", effort)
+    monkeypatch.setenv("FORECASTER_MAX_TOKENS", str(minimum))
+    assert ckai_bot.make_forecaster(OPUS).litellm_kwargs["max_tokens"] == minimum
+    monkeypatch.setenv("FORECASTER_MAX_TOKENS", str(minimum - 1))
+    with pytest.raises(ValueError, match="FORECASTER_MAX_TOKENS"):
+        ckai_bot.make_forecaster(OPUS)
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-5000", "1.5", "32000.0", "128001"])
+def test_invalid_cap_is_refused(monkeypatch, value):
+    monkeypatch.setenv("FORECASTER_MAX_TOKENS", value)
+    with pytest.raises(ValueError, match="FORECASTER_MAX_TOKENS"):
+        ckai_bot.make_forecaster(OPUS)
+
+
+def test_upper_limit_passes(monkeypatch):
+    monkeypatch.setenv("FORECASTER_MAX_TOKENS", "128000")
+    assert ckai_bot.make_forecaster(OPUS).litellm_kwargs["max_tokens"] == 128000
+
+
+def test_cap_only_on_openrouter_forecasters(monkeypatch, caplog):
+    from claude_cli_llm import ClaudeCliLlm
+
+    monkeypatch.setenv("REASONING_EFFORT", "high")
+    monkeypatch.setenv("FORECASTER_MAX_TOKENS", "40000")
+    bot = ckai_bot.build_bot(publish=False, forecaster_models=[OPUS, OTHER])
+    for llm in [bot._llms["default"], *bot._forecasters]:
+        assert llm.litellm_kwargs["max_tokens"] == 40000
+    for purpose in ("summarizer", "parser"):
+        assert "max_tokens" not in bot._llms[purpose].litellm_kwargs
+    cli = ckai_bot.make_forecaster("claude-cli/claude-test-1")
+    assert isinstance(cli, ClaudeCliLlm)
+    assert "max_tokens" not in cli.litellm_kwargs
+    with caplog.at_level("WARNING"):
+        direct = ckai_bot.make_forecaster("anthropic/claude-test-opus")
+    assert "max_tokens" not in direct.litellm_kwargs
+    assert "openrouter/ models only" in caplog.text
+
+
+@pytest.mark.parametrize(("finish_reason", "warned"), [("length", True), ("stop", False)])
+def test_truncated_answer_is_flagged(monkeypatch, captured_requests, caplog, finish_reason, warned):
+    CANNED_FINISH_REASON[0] = finish_reason
+    monkeypatch.setenv("REASONING_EFFORT", "high")
+    with caplog.at_level("INFO", logger="ckai_bot"):
+        asyncio.run(ckai_bot.make_forecaster(OPUS).invoke("Will it rain?"))
+    assert "Forecaster call openrouter/anthropic/claude-test-opus" in caplog.text
+    assert f"finish_reason {finish_reason}" in caplog.text
+    assert ("answer was cut off" in caplog.text) is warned

@@ -15,6 +15,8 @@ What it adds to the template:
   edit: FORECASTER_MODELS, RESEARCHER_MODEL, SUMMARIZER_MODEL, PARSER_MODEL.
   REASONING_EFFORT (low, medium, high, ...) applies to OpenRouter forecasters;
   with it set, no custom temperature is sent and the timeout is longer.
+  FORECASTER_MAX_TOKENS caps their output (thinking plus answer); it defaults
+  to 32000 at low, medium and high effort.
   Anything left unset falls back to the template's defaults.
 - Dry run: `--dry-run` (or DRY_RUN=true) forecasts without publishing anything
   to Metaculus and saves the reports to ./forecast_reports for review.
@@ -46,7 +48,9 @@ import logging
 import os
 import signal
 import sys
+import time
 from collections.abc import Sequence
+from fractions import Fraction
 from typing import Literal
 
 import dotenv
@@ -140,26 +144,108 @@ def reasoning_effort() -> str | None:
     return value
 
 
+# OpenRouter sets an Anthropic model's thinking budget to this share of
+# max_tokens (openrouter.ai/docs/use-cases/reasoning-tokens); the rest is left
+# for the answer.
+THINKING_SHARE = {
+    "none": Fraction(0),
+    "minimal": Fraction("0.1"),
+    "low": Fraction("0.2"),
+    "medium": Fraction("0.5"),
+    "high": Fraction("0.8"),
+    "xhigh": Fraction("0.95"),
+    "max": Fraction("0.95"),
+}
+MIN_ANSWER_TOKENS = 4000  # room the template's rationale and final answer need
+MAX_TOKENS_LIMIT = 128000
+DEFAULT_MAX_TOKENS = 32000
+DEFAULT_MAX_TOKENS_EFFORTS = ("low", "medium", "high")
+
+
+def min_max_tokens(effort: str | None) -> int:
+    """The smallest cap that leaves MIN_ANSWER_TOKENS after the thinking budget."""
+    answer_share = 1 - THINKING_SHARE[effort or "none"]
+    return -(-MIN_ANSWER_TOKENS // answer_share)  # ceiling division on a Fraction
+
+
+def forecaster_max_tokens(effort: str | None) -> int | None:
+    """FORECASTER_MAX_TOKENS for OpenRouter forecasters, the default for this
+    effort if unset, or None to send no cap."""
+    raw = _env("FORECASTER_MAX_TOKENS")
+    if raw is None:
+        return DEFAULT_MAX_TOKENS if effort in DEFAULT_MAX_TOKENS_EFFORTS else None
+    minimum = int(min_max_tokens(effort))
+    if not raw.isdigit() or not minimum <= int(raw) <= MAX_TOKENS_LIMIT:
+        raise ValueError(
+            f"FORECASTER_MAX_TOKENS={raw!r}: use a whole number from {minimum} to "
+            f"{MAX_TOKENS_LIMIT} (at REASONING_EFFORT={effort or 'unset'}, smaller caps leave "
+            f"under {MIN_ANSWER_TOKENS} tokens for the answer after thinking)"
+        )
+    return int(raw)
+
+
+class CappedForecasterLlm(GeneralLlm):
+    """An OpenRouter forecaster that logs each call's length and token use, and
+    warns when the answer was cut off at max_tokens. forecasting-tools passes a
+    truncated answer on as if it were complete."""
+
+    async def _call_litellm(self, prompt):
+        start = time.monotonic()
+        response = await super()._call_litellm(prompt)
+        seconds = time.monotonic() - start
+        try:
+            finish_reason = response.choices[0].finish_reason
+        except (AttributeError, IndexError):
+            finish_reason = None
+        usage = getattr(response, "usage", None)
+        completion = getattr(usage, "completion_tokens", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning = getattr(details, "reasoning_tokens", None)
+        cap = self.litellm_kwargs.get("max_tokens")
+        logger.info(
+            f"Forecaster call {self.model}: {seconds:.0f}s, {completion} completion tokens "
+            f"({reasoning} reasoning), cap {cap}, finish_reason {finish_reason}"
+        )
+        if finish_reason == "length":
+            logger.warning(
+                f"Forecaster {self.model} hit max_tokens ({cap}) and its answer was cut off. "
+                "Raise FORECASTER_MAX_TOKENS or lower REASONING_EFFORT."
+            )
+        return response
+
+
 def make_forecaster(model: str) -> GeneralLlm:
-    """A forecasting model, with REASONING_EFFORT applied if set. Only
-    OpenRouter models get it: litellm maps it differently for providers called
-    directly (a small Anthropic thinking budget, dropped or rejected values for
-    OpenAI and Gemini). Reasoning models take no custom temperature, so none
-    is sent with it. claude-cli models use Claude Code's own thinking settings."""
+    """A forecasting model, with REASONING_EFFORT and FORECASTER_MAX_TOKENS
+    applied if set. Only OpenRouter models get them: litellm maps reasoning
+    differently for providers called directly (a small Anthropic thinking
+    budget, dropped or rejected values for OpenAI and Gemini). Reasoning models
+    take no custom temperature, so none is sent with it. claude-cli models use
+    Claude Code's own thinking settings."""
     effort = reasoning_effort()
-    if effort is None or is_claude_cli(model):
+    max_tokens = forecaster_max_tokens(effort)
+    if is_claude_cli(model):
         return make_llm(model)
     if not model.startswith("openrouter/"):
-        logger.warning(
-            f"REASONING_EFFORT applies to openrouter/ models only; {model} runs at its default."
-        )
+        if effort is not None or _env("FORECASTER_MAX_TOKENS") is not None:
+            logger.warning(
+                f"REASONING_EFFORT and FORECASTER_MAX_TOKENS apply to openrouter/ models only; "
+                f"{model} runs at its defaults."
+            )
         return make_llm(model)
-    return GeneralLlm(
+    kwargs: dict[str, object] = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if effort is None:
+        return CappedForecasterLlm(
+            model=model, temperature=0.3, timeout=120, allowed_tries=2, **kwargs
+        )
+    return CappedForecasterLlm(
         model=model,
         temperature=None,
         timeout=REASONING_TIMEOUT,
         allowed_tries=2,
         reasoning_effort=effort,
+        **kwargs,
     )
 
 
@@ -411,10 +497,13 @@ def main() -> None:
         parser.error("--max-questions needs --mode test_questions and a number of at least 1")
     try:
         effort = reasoning_effort()  # checked even if FORECASTER_MODELS is unset
+        max_tokens = forecaster_max_tokens(effort)
     except ValueError as exc:
         sys.exit(str(exc))
     if effort:
         logger.info(f"Reasoning effort for OpenRouter forecasters: {effort}")
+    if max_tokens:
+        logger.info(f"Max tokens for OpenRouter forecasters: {max_tokens}")
 
     if uses_claude_cli():
         try:

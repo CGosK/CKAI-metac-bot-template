@@ -66,6 +66,7 @@ jobs:
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           PREDICTIONS_PER_QUESTION: ${{ vars.PREDICTIONS_PER_QUESTION }}
           REASONING_EFFORT: ${{ vars.REASONING_EFFORT }}
+          FORECASTER_MAX_TOKENS: ${{ vars.FORECASTER_MAX_TOKENS }}
           DRY_RUN: ${{ inputs.dry_run }}
           MAX_QUESTIONS: ${{ inputs.max_questions }}
       - name: Save dry-run reports
