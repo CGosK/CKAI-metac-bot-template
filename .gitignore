@@ -175,3 +175,8 @@ cython_debug/
 # Local scratch/temp scripts
 temp/
 forecast_reports/
+
+# Backtest data and outputs (ForecastBench data is CC-BY-SA; never committed)
+backtest/data/
+backtest/runs/
+backtest/out/
