@@ -22,8 +22,9 @@ What it adds to the template:
   questions, spread across question types, for a small first run.
 - Local development on a Claude subscription: models named `claude-cli/<id>`
   run through headless Claude Code (see claude_cli_llm.py). They are refused
-  in CI, when publishing, outside the bot-testing area, and unless every model
-  setting is a claude-cli model.
+  in CI, when publishing, outside the bot-testing area, and unless every LLM
+  setting is a claude-cli model (research may also be no_research or
+  asknews/news-summaries).
 
 Usage:
     uv run python ckai_bot.py --mode test_questions --dry-run
@@ -165,6 +166,31 @@ def make_forecaster(model: str) -> GeneralLlm:
 MODEL_SETTINGS = ("FORECASTER_MODELS", "RESEARCHER_MODEL", "SUMMARIZER_MODEL", "PARSER_MODEL")
 
 
+# Research settings allowed alongside claude-cli models: none, or AskNews news
+# search. Only news-summaries: AskNews's deep-research presets run a model on
+# AskNews's servers (and the deeper ones ask for premium sources).
+ASKNEWS_PRESETS = ("asknews/news-summaries",)
+
+
+def is_allowed_research_strategy(value: object) -> bool:
+    return value == "no_research" or value in ASKNEWS_PRESETS
+
+
+def asknews_credentials_problem() -> str | None:
+    """Why AskNews can't run with the current settings, or None if it can."""
+    placeholders = [
+        var
+        for var in ("ASKNEWS_CLIENT_ID", "ASKNEWS_SECRET")
+        if (os.getenv(var) or "").strip() and not _env(var)
+    ]
+    if placeholders:
+        # The library reads the raw values and prefers this pair over an API key.
+        return f"{' and '.join(placeholders)} still a placeholder; remove or fill in"
+    if _env("ASKNEWS_API_KEY") or (_env("ASKNEWS_CLIENT_ID") and _env("ASKNEWS_SECRET")):
+        return None
+    return "ASKNEWS_API_KEY (or ASKNEWS_CLIENT_ID + ASKNEWS_SECRET) for AskNews research"
+
+
 def uses_claude_cli() -> bool:
     """True if any model setting names a claude-cli model."""
     return any(
@@ -190,15 +216,20 @@ def check_claude_cli_config(run_mode: str, publish: bool) -> None:
     if not forecasters or not all(is_claude_cli(m) for m in forecasters):
         problems.append("FORECASTER_MODELS")
     researcher = _env("RESEARCHER_MODEL")
-    if not (researcher == "no_research" or is_claude_cli(researcher)):
-        problems.append("RESEARCHER_MODEL (claude-cli/... or no_research)")
+    if not (is_allowed_research_strategy(researcher) or is_claude_cli(researcher)):
+        problems.append(
+            "RESEARCHER_MODEL (claude-cli/..., no_research, or one of " + ", ".join(ASKNEWS_PRESETS) + ")"
+        )
+    elif researcher in ASKNEWS_PRESETS and asknews_credentials_problem():
+        problems.append(asknews_credentials_problem())
     for var in ("SUMMARIZER_MODEL", "PARSER_MODEL"):
         if not is_claude_cli(_env(var)):
             problems.append(var)
     if problems:
         raise ClaudeCliRefused(
-            "With claude-cli models, every model setting must be a claude-cli model, so no "
-            "library default is used. Set: " + ", ".join(problems)
+            "With claude-cli models, every LLM setting must be a claude-cli model (research may "
+            "also be no_research or AskNews), so no library default is used. Set: "
+            + ", ".join(problems)
         )
 
 
@@ -260,7 +291,13 @@ class CkaiBot(FallTemplateBot2026):
             for purpose, llm in self._llms.items()
             if not (
                 isinstance(llm, ClaudeCliLlm)
-                or (purpose == "researcher" and llm == "no_research")
+                # A research strategy counts only if set explicitly: the library
+                # picks AskNews by default whenever its keys are present.
+                or (
+                    purpose == "researcher"
+                    and is_allowed_research_strategy(llm)
+                    and llm == _env("RESEARCHER_MODEL")
+                )
             )
         ]
         not_cli += [llm.model for llm in self._forecasters if not isinstance(llm, ClaudeCliLlm)]

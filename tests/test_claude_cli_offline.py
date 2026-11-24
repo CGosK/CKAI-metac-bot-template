@@ -435,3 +435,123 @@ def test_pick_questions_spreads_types_and_skips_conditionals():
     ]
     picked = ckai_bot.pick_questions(conditionals + binaries + numerics, 4)
     assert [q.question_text for q in picked] == ["b0", "n0", "b1", "n1"]
+
+
+# ---- AskNews research with claude-cli models (run anywhere) ---------------------
+
+
+def _asknews_env(monkeypatch, preset="asknews/news-summaries"):
+    all_cli_env(monkeypatch, researcher=preset)
+    for var in ("ASKNEWS_API_KEY", "ASKNEWS_CLIENT_ID", "ASKNEWS_SECRET"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_config_allows_asknews_with_a_key(monkeypatch):
+    import ckai_bot
+
+    _asknews_env(monkeypatch)
+    monkeypatch.setenv("ASKNEWS_API_KEY", "offline-test-not-a-real-key")
+    ckai_bot.check_claude_cli_config("test_questions", publish=False)
+    monkeypatch.delenv("ASKNEWS_API_KEY")
+    monkeypatch.setenv("ASKNEWS_CLIENT_ID", "offline-test-id")
+    monkeypatch.setenv("ASKNEWS_SECRET", "offline-test-secret")
+    ckai_bot.check_claude_cli_config("test_questions", publish=False)
+
+
+def test_config_refuses_asknews_without_a_key(monkeypatch):
+    import ckai_bot
+
+    _asknews_env(monkeypatch)
+    with pytest.raises(ckai_bot.ClaudeCliRefused, match="ASKNEWS_API_KEY"):
+        ckai_bot.check_claude_cli_config("test_questions", publish=False)
+    monkeypatch.setenv("ASKNEWS_CLIENT_ID", "offline-test-id")  # half a pair isn't enough
+    with pytest.raises(ckai_bot.ClaudeCliRefused, match="ASKNEWS_API_KEY"):
+        ckai_bot.check_claude_cli_config("test_questions", publish=False)
+
+
+@pytest.mark.parametrize(
+    "preset",
+    [
+        "asknews/unknown-preset",
+        "asknews/",
+        "smart-searcher/x",
+        "asknews/deep-research/low-depth",
+        "asknews/deep-research/medium-depth",
+        "asknews/deep-research/high-depth",
+    ],
+)
+def test_config_refuses_other_research_strategies(monkeypatch, preset):
+    import ckai_bot
+
+    _asknews_env(monkeypatch, preset=preset)
+    monkeypatch.setenv("ASKNEWS_API_KEY", "offline-test-not-a-real-key")
+    with pytest.raises(ckai_bot.ClaudeCliRefused, match="RESEARCHER_MODEL"):
+        ckai_bot.check_claude_cli_config("test_questions", publish=False)
+
+
+def test_bot_refuses_unknown_research_strategy(monkeypatch):
+    import ckai_bot
+
+    _asknews_env(monkeypatch, preset="asknews/unknown-preset")
+    with pytest.raises(ckai_bot.ClaudeCliRefused, match="researcher"):
+        ckai_bot.build_bot(publish=False, forecaster_models=[CLI])
+
+
+def test_research_goes_to_asknews(monkeypatch):
+    """With AskNews research, the research step calls AskNews and no model."""
+    import ckai_bot
+    import main
+    from forecasting_tools import BinaryQuestion
+
+    _asknews_env(monkeypatch)
+    monkeypatch.setenv("ASKNEWS_API_KEY", "offline-test-not-a-real-key")
+    calls: list[tuple[str, str]] = []
+
+    async def fake_preset(self, preset, prompt):
+        calls.append((preset, prompt))
+        return "Canned AskNews research."
+
+    monkeypatch.setattr(main.AskNewsSearcher, "call_preconfigured_version", fake_preset)
+
+    async def no_model_calls(self, *args, **kwargs):
+        raise AssertionError("research called a model")
+
+    import claude_cli_llm
+    from forecasting_tools import GeneralLlm
+
+    monkeypatch.setattr(GeneralLlm, "invoke", no_model_calls)
+    monkeypatch.setattr(claude_cli_llm.ClaudeCliLlm, "invoke", no_model_calls)
+    bot = ckai_bot.build_bot(publish=False, forecaster_models=[CLI])
+    assert bot._llms["researcher"] == "asknews/news-summaries"
+    question = BinaryQuestion(
+        question_text="Will it rain?",
+        page_url="https://www.metaculus.com/questions/1/",
+        tournament_slugs=["bot-testing-area"],
+    )
+    research = asyncio.run(bot.run_research(question))
+    assert research == "Canned AskNews research."
+    assert calls == [("asknews/news-summaries", "Will it rain?")]
+
+
+def test_bot_refuses_asknews_picked_as_a_library_default(monkeypatch):
+    """With RESEARCHER_MODEL unset, the library picks AskNews when its key is set.
+    That's a library default, so the bot-level check refuses it."""
+    import ckai_bot
+
+    _asknews_env(monkeypatch)
+    monkeypatch.delenv("RESEARCHER_MODEL")
+    monkeypatch.setenv("ASKNEWS_API_KEY", "offline-test-not-a-real-key")
+    with pytest.raises(ckai_bot.ClaudeCliRefused, match="researcher"):
+        ckai_bot.build_bot(publish=False, forecaster_models=[CLI])
+
+
+def test_config_refuses_placeholder_asknews_pair(monkeypatch):
+    """The library prefers a client id + secret over an API key, even placeholders."""
+    import ckai_bot
+
+    _asknews_env(monkeypatch)
+    monkeypatch.setenv("ASKNEWS_API_KEY", "offline-test-not-a-real-key")
+    monkeypatch.setenv("ASKNEWS_CLIENT_ID", "REPLACE_ME")
+    monkeypatch.setenv("ASKNEWS_SECRET", "REPLACE_ME")
+    with pytest.raises(ckai_bot.ClaudeCliRefused, match="placeholder"):
+        ckai_bot.check_claude_cli_config("test_questions", publish=False)

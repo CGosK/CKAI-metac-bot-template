@@ -37,7 +37,8 @@ Then: `uv run python ckai_bot.py --mode test_questions --dry-run --max-questions
 
 - Every call goes through rkit's runner (`claude_cli_llm.py`): a clean environment, the personal Claude config, and a usage guard that pauses before extra usage would be used. Without rkit the backend refuses to run.
 - Research gets only WebSearch and WebFetch. Forecasting, summarising and parsing get no tools.
-- It refuses to run in CI, to publish, outside the bot-testing area, or unless every model setting is a `claude-cli/` model, so no library default slips in.
+- To use the live bot's research instead, set `RESEARCHER_MODEL=asknews/news-summaries` and `ASKNEWS_API_KEY` (or `ASKNEWS_CLIENT_ID` + `ASKNEWS_SECRET`) in `.env`. Calls count against your free AskNews quota. AskNews's deep-research presets are refused here, because they run a model on AskNews's servers.
+- It refuses to run in CI, to publish, outside the bot-testing area, or unless every LLM setting is a `claude-cli/` model (research may also be `no_research` or `asknews/news-summaries`), so no library default slips in.
 - Call logs go to `~/.cache/ckai-bot-runs/`.
 
 This is for development dry runs only. The live bot uses API keys.
