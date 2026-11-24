@@ -2,8 +2,9 @@ name: Forecast on Metaculus Cup
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 */2 * *" # runs at midnight every 2 days
+  # Schedule is off by default. Uncomment to forecast on the Metaculus Cup every 2 days.
+  # schedule:
+  #   - cron: "0 0 */2 * *" # runs at midnight every 2 days
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -30,7 +31,7 @@ jobs:
         run: uv sync --locked
       - name: Run bot
         run: |
-          uv run python main.py --mode metaculus_cup
+          uv run python ckai_bot.py --mode metaculus_cup
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -42,3 +43,9 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          # CKAI bot model choices: set under Settings -> Secrets and variables -> Actions -> Variables
+          FORECASTER_MODELS: ${{ vars.FORECASTER_MODELS }}
+          RESEARCHER_MODEL: ${{ vars.RESEARCHER_MODEL }}
+          SUMMARIZER_MODEL: ${{ vars.SUMMARIZER_MODEL }}
+          PARSER_MODEL: ${{ vars.PARSER_MODEL }}
+          PREDICTIONS_PER_QUESTION: ${{ vars.PREDICTIONS_PER_QUESTION }}

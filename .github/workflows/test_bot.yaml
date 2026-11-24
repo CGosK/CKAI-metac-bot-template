@@ -2,6 +2,11 @@ name: Test Bot
 
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: forecast without posting anything to Metaculus"
+        type: boolean
+        default: true
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -28,7 +33,7 @@ jobs:
         run: uv sync --locked
       - name: Run bot
         run: |
-          uv run python main.py --mode test_questions
+          uv run python ckai_bot.py --mode test_questions
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -40,3 +45,17 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          # CKAI bot model choices: set under Settings -> Secrets and variables -> Actions -> Variables
+          FORECASTER_MODELS: ${{ vars.FORECASTER_MODELS }}
+          RESEARCHER_MODEL: ${{ vars.RESEARCHER_MODEL }}
+          SUMMARIZER_MODEL: ${{ vars.SUMMARIZER_MODEL }}
+          PARSER_MODEL: ${{ vars.PARSER_MODEL }}
+          PREDICTIONS_PER_QUESTION: ${{ vars.PREDICTIONS_PER_QUESTION }}
+          DRY_RUN: ${{ inputs.dry_run }}
+      - name: Save dry-run reports
+        if: always() && inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: forecast-reports
+          path: forecast_reports/
+          if-no-files-found: ignore

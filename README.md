@@ -1,3 +1,26 @@
+# CKAI forecasting bot
+
+This fork runs `ckai_bot.py`, a thin layer on Metaculus's template bot (`main.py` is left as Metaculus ships it, so each season's template update merges cleanly). It adds:
+
+- **Model ensemble:** set the `FORECASTER_MODELS` variable to a comma-separated list of models. Each question's predictions are spread evenly across them, aggregated the template's usual way, and every rationale in the posted comment is labelled with its model.
+- **Models from settings, not code:** `FORECASTER_MODELS`, `RESEARCHER_MODEL`, `SUMMARIZER_MODEL`, `PARSER_MODEL` and `PREDICTIONS_PER_QUESTION`. Anything unset falls back to the template's defaults.
+- **Dry run:** `--dry-run` (or `DRY_RUN=true`) forecasts without posting anything and saves the reports to `forecast_reports/`. The Test Bot workflow is a dry run unless you untick the box.
+- **Schedules off:** the tournament and Metaculus Cup workflows run only by hand until you uncomment their schedules for the January season.
+- **Offline tests:** `uv run --with pytest python -m pytest tests -q` runs the bot on stand-in models and local questions of every type. No keys needed, nothing is called or posted.
+
+## Setup (GitHub Actions)
+
+1. **Secrets** (Settings → Secrets and variables → Actions → Secrets): `METACULUS_TOKEN` from your Metaculus bot account, and `OPENROUTER_API_KEY` from the Metaculus credits form or your own OpenRouter account. AskNews (`ASKNEWS_CLIENT_ID`, `ASKNEWS_SECRET`) is optional and free for registered bot makers.
+2. **Variables** (same page → Variables): `FORECASTER_MODELS`, for example one current model each from Anthropic, OpenAI and Google, written as `openrouter/<provider>/<model>` and comma-separated. Pick models your credits cover.
+3. **Enable Actions** on the Actions tab.
+4. **Dry run:** Actions → Test Bot → Run workflow, leaving "Dry run" ticked. Download the `forecast-reports` artifact to read what it would have posted.
+5. **Live test:** run Test Bot again with "Dry run" unticked. It posts to Metaculus's unscored bot-testing area.
+6. **January:** uncomment the schedule in `.github/workflows/run_bot_on_tournament.yaml` once the season opens.
+
+Tournament rule: you may not run the bot on open or upcoming tournament questions, look at its output and then change the bot. Iterate on the bot-testing area or closed questions instead.
+
+---
+
 # Simple Metaculus forecasting bot
 This repository contains a simple bot meant to get you started with creating your own bot for the AI Forecasting Tournament. Go to https://www.metaculus.com/futureeval/participate/ for more info and tournament rules (and then go to the  "Getting Started" section of our [resources](https://www.metaculus.com/notebooks/38928/ai-benchmark-resources/#want-to-join-the-ai-forecasting-benchmark) page).
 

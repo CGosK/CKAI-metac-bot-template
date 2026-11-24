@@ -2,8 +2,10 @@ name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
+  # Schedule is off until the January season opens. To turn it on, uncomment the
+  # two lines below. Every run publishes forecasts to the live tournament.
+  # schedule:
+  #   - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -30,7 +32,7 @@ jobs:
         run: uv sync --locked
       - name: Run bot
         run: |
-          uv run python main.py
+          uv run python ckai_bot.py --mode tournament
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -42,3 +44,9 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          # CKAI bot model choices: set under Settings -> Secrets and variables -> Actions -> Variables
+          FORECASTER_MODELS: ${{ vars.FORECASTER_MODELS }}
+          RESEARCHER_MODEL: ${{ vars.RESEARCHER_MODEL }}
+          SUMMARIZER_MODEL: ${{ vars.SUMMARIZER_MODEL }}
+          PARSER_MODEL: ${{ vars.PARSER_MODEL }}
+          PREDICTIONS_PER_QUESTION: ${{ vars.PREDICTIONS_PER_QUESTION }}
