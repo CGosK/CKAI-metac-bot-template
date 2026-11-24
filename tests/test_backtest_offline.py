@@ -160,7 +160,12 @@ def test_metaculus_is_blocked(monkeypatch):
 def test_existing_batch_is_not_overwritten(monkeypatch, tmp_path):
     import claude_cli_llm
 
+    import json
+
+    questions = tmp_path / "questions.json"
+    questions.write_text(json.dumps({"sha256": "x", "questions": []}))
     (tmp_path / "pilot").mkdir()
+    monkeypatch.setattr(run, "QUESTIONS", questions)  # the real list is local data, not in the repo
     monkeypatch.setattr(run, "RUNS", tmp_path)
     monkeypatch.setattr(claude_cli_llm, "refuse_in_ci", lambda: None)
     monkeypatch.setattr(run, "configure_env", lambda: None)
