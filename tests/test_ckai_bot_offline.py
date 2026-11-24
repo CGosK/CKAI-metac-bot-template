@@ -34,6 +34,7 @@ def offline_env(monkeypatch):
     monkeypatch.setenv("SUMMARIZER_MODEL", "openrouter/test/summarizer")
     monkeypatch.setenv("PARSER_MODEL", "openrouter/test/parser")
     monkeypatch.setenv("OPENROUTER_API_KEY", "offline-test-not-a-real-key")
+    monkeypatch.delenv("REASONING_EFFORT", raising=False)
     yield
 
 

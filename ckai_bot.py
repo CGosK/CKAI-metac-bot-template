@@ -13,6 +13,8 @@ What it adds to the template:
   the posted comment is labelled with the model that wrote it.
 - Model choice from environment variables, so models can change without a code
   edit: FORECASTER_MODELS, RESEARCHER_MODEL, SUMMARIZER_MODEL, PARSER_MODEL.
+  REASONING_EFFORT (low, medium, high, ...) applies to OpenRouter forecasters;
+  with it set, no custom temperature is sent and the timeout is longer.
   Anything left unset falls back to the template's defaults.
 - Dry run: `--dry-run` (or DRY_RUN=true) forecasts without publishing anything
   to Metaculus and saves the reports to ./forecast_reports for review.
@@ -120,6 +122,46 @@ def make_llm(
     )
 
 
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_TIMEOUT = 600  # seconds; high reasoning can take minutes per forecast
+
+
+def reasoning_effort() -> str | None:
+    """REASONING_EFFORT for the forecasters, or None to use each model's default."""
+    value = _env("REASONING_EFFORT")
+    if value is None:
+        return None
+    value = value.lower()
+    if value not in REASONING_EFFORTS:
+        raise ValueError(
+            f"REASONING_EFFORT={value!r}: use one of {', '.join(REASONING_EFFORTS)}"
+        )
+    return value
+
+
+def make_forecaster(model: str) -> GeneralLlm:
+    """A forecasting model, with REASONING_EFFORT applied if set. Only
+    OpenRouter models get it: litellm maps it differently for providers called
+    directly (a small Anthropic thinking budget, dropped or rejected values for
+    OpenAI and Gemini). Reasoning models take no custom temperature, so none
+    is sent with it. claude-cli models use Claude Code's own thinking settings."""
+    effort = reasoning_effort()
+    if effort is None or is_claude_cli(model):
+        return make_llm(model)
+    if not model.startswith("openrouter/"):
+        logger.warning(
+            f"REASONING_EFFORT applies to openrouter/ models only; {model} runs at its default."
+        )
+        return make_llm(model)
+    return GeneralLlm(
+        model=model,
+        temperature=None,
+        timeout=REASONING_TIMEOUT,
+        allowed_tries=2,
+        reasoning_effort=effort,
+    )
+
+
 MODEL_SETTINGS = ("FORECASTER_MODELS", "RESEARCHER_MODEL", "SUMMARIZER_MODEL", "PARSER_MODEL")
 
 
@@ -165,7 +207,7 @@ def llms_from_env() -> dict[str, str | GeneralLlm]:
     llms: dict[str, str | GeneralLlm] = {}
     forecasters = parse_model_list(_env("FORECASTER_MODELS"))
     if forecasters:
-        llms["default"] = make_llm(forecasters[0])
+        llms["default"] = make_forecaster(forecasters[0])
     for purpose, var in (
         ("researcher", "RESEARCHER_MODEL"),
         ("summarizer", "SUMMARIZER_MODEL"),
@@ -197,7 +239,7 @@ class CkaiBot(FallTemplateBot2026):
     def __init__(self, *args, forecaster_models: list[str] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self._forecasters: list[GeneralLlm] = [
-            make_llm(m) for m in (forecaster_models or [])
+            make_forecaster(m) for m in (forecaster_models or [])
         ]
         self._next_forecaster = 0
         self._claude_cli = any(
@@ -330,6 +372,12 @@ def main() -> None:
     publish = not dry_run
     if args.max_questions is not None and (run_mode != "test_questions" or args.max_questions < 1):
         parser.error("--max-questions needs --mode test_questions and a number of at least 1")
+    try:
+        effort = reasoning_effort()  # checked even if FORECASTER_MODELS is unset
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if effort:
+        logger.info(f"Reasoning effort for OpenRouter forecasters: {effort}")
 
     if uses_claude_cli():
         try:

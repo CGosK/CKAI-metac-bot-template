@@ -7,6 +7,10 @@ on:
         description: "Dry run: forecast without posting anything to Metaculus"
         type: boolean
         default: true
+      max_questions:
+        description: "Forecast only this many bot-testing-area questions (blank = all)"
+        type: string
+        default: ""
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -32,8 +36,17 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
       - name: Run bot
+        # The input arrives through an environment variable, not pasted into the
+        # script, and must be a whole number.
         run: |
-          uv run python ckai_bot.py --mode test_questions
+          if [ -n "$MAX_QUESTIONS" ]; then
+            case "$MAX_QUESTIONS" in
+              *[!0-9]*) echo "max_questions must be a whole number" >&2; exit 1 ;;
+            esac
+            uv run python ckai_bot.py --mode test_questions --max-questions "$MAX_QUESTIONS"
+          else
+            uv run python ckai_bot.py --mode test_questions
+          fi
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -51,7 +64,9 @@ jobs:
           SUMMARIZER_MODEL: ${{ vars.SUMMARIZER_MODEL }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           PREDICTIONS_PER_QUESTION: ${{ vars.PREDICTIONS_PER_QUESTION }}
+          REASONING_EFFORT: ${{ vars.REASONING_EFFORT }}
           DRY_RUN: ${{ inputs.dry_run }}
+          MAX_QUESTIONS: ${{ inputs.max_questions }}
       - name: Save dry-run reports
         if: always() && inputs.dry_run
         uses: actions/upload-artifact@v4

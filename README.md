@@ -3,7 +3,8 @@
 This fork runs `ckai_bot.py`, a thin layer on Metaculus's template bot (`main.py` is left as Metaculus ships it, so each season's template update merges cleanly). It adds:
 
 - **Model ensemble:** set the `FORECASTER_MODELS` variable to a comma-separated list of models. Each question's predictions are spread evenly across them, aggregated the template's usual way, and every rationale in the posted comment is labelled with its model.
-- **Models from settings, not code:** `FORECASTER_MODELS`, `RESEARCHER_MODEL`, `SUMMARIZER_MODEL`, `PARSER_MODEL` and `PREDICTIONS_PER_QUESTION`. Anything unset falls back to the template's defaults.
+- **Models from settings, not code:** `FORECASTER_MODELS`, `RESEARCHER_MODEL`, `SUMMARIZER_MODEL`, `PARSER_MODEL` and `PREDICTIONS_PER_QUESTION`. Anything unset falls back to the template's defaults, which are old models, so set all of them.
+- **Reasoning effort:** `REASONING_EFFORT` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`; `max` is sent to OpenRouter as `xhigh`) is sent with every call to an `openrouter/` forecaster. Other providers, the helper models and `claude-cli/` models are left at their defaults. With it set, no custom temperature is sent and calls get a 10-minute timeout. On Metaculus's model leaderboard (November 2026), the "High" version of a model scored above the standard version in 12 of 13 pairs; the exception, GPT-5, was level. Two related pairs went the other way: GPT-5.5 High vs Instant, and Qwen3 Max Thinking vs Qwen 3 Max.
 - **Dry run:** `--dry-run` (or `DRY_RUN=true`) forecasts without posting anything and saves the reports to `forecast_reports/`. The Test Bot workflow is a dry run unless you untick the box.
 - **Schedules off:** the tournament and Metaculus Cup workflows run only by hand until you uncomment their schedules for the January season.
 - **Offline tests:** `uv run --with pytest python -m pytest tests -q` runs the bot on stand-in models and local questions of every type. No keys needed, nothing is called or posted.
@@ -13,7 +14,7 @@ This fork runs `ckai_bot.py`, a thin layer on Metaculus's template bot (`main.py
 1. **Secrets** (Settings → Secrets and variables → Actions → Secrets): `METACULUS_TOKEN` from your Metaculus bot account, and `OPENROUTER_API_KEY` from the Metaculus credits form or your own OpenRouter account. AskNews (`ASKNEWS_CLIENT_ID`, `ASKNEWS_SECRET`) is optional and free for registered bot makers.
 2. **Variables** (same page → Variables): `FORECASTER_MODELS`, for example one current model each from Anthropic, OpenAI and Google, written as `openrouter/<provider>/<model>` and comma-separated. Pick models your credits cover.
 3. **Enable Actions** on the Actions tab.
-4. **Dry run:** Actions → Test Bot → Run workflow, leaving "Dry run" ticked. Download the `forecast-reports` artifact to read what it would have posted.
+4. **Dry run:** Actions → Test Bot → Run workflow, leaving "Dry run" ticked. Set "max questions" (for example 2) to keep a first run with new models or `REASONING_EFFORT` small. Download the `forecast-reports` artifact to read what it would have posted.
 5. **Live test:** run Test Bot again with "Dry run" unticked. It posts to Metaculus's unscored bot-testing area.
 6. **January:** first merge Metaculus's template update for the new season. Tournament mode reads the tournament ID from the pinned `forecasting-tools` version, so without the update it targets the old season. Then uncomment the schedule in `.github/workflows/run_bot_on_tournament.yaml`.
 

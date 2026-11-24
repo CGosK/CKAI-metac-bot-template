@@ -49,3 +49,4 @@ jobs:
           SUMMARIZER_MODEL: ${{ vars.SUMMARIZER_MODEL }}
           PARSER_MODEL: ${{ vars.PARSER_MODEL }}
           PREDICTIONS_PER_QUESTION: ${{ vars.PREDICTIONS_PER_QUESTION }}
+          REASONING_EFFORT: ${{ vars.REASONING_EFFORT }}
