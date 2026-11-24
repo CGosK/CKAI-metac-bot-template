@@ -16,9 +16,16 @@ What it adds to the template:
   Anything left unset falls back to the template's defaults.
 - Dry run: `--dry-run` (or DRY_RUN=true) forecasts without publishing anything
   to Metaculus and saves the reports to ./forecast_reports for review.
+- `--max-questions N` (test_questions mode): forecast only N bot-testing-area
+  questions, spread across question types, for a small first run.
+- Local development on a Claude subscription: models named `claude-cli/<id>`
+  run through headless Claude Code (see claude_cli_llm.py). They are refused
+  in CI, when publishing, outside the bot-testing area, and unless every model
+  setting is a claude-cli model.
 
 Usage:
     uv run python ckai_bot.py --mode test_questions --dry-run
+    uv run python ckai_bot.py --mode test_questions --dry-run --max-questions 3
     uv run python ckai_bot.py --mode test_questions
     uv run python ckai_bot.py --mode tournament
 
@@ -34,6 +41,9 @@ import asyncio
 import contextvars
 import logging
 import os
+import signal
+import sys
+from collections.abc import Sequence
 from typing import Literal
 
 import dotenv
@@ -48,6 +58,7 @@ from bot_helpers import (
 silence_noisy_dependencies()
 
 from forecasting_tools import (  # noqa: E402
+    ConditionalQuestion,
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
@@ -55,6 +66,15 @@ from forecasting_tools import (  # noqa: E402
     ReasonedPrediction,
 )
 
+from claude_cli_llm import (  # noqa: E402
+    PLAIN,
+    RESEARCH,
+    ClaudeCliLlm,
+    ClaudeCliRefused,
+    is_claude_cli,
+    kill_running_calls,
+    refuse_in_ci,
+)
 from main import FallTemplateBot2026  # noqa: E402
 
 dotenv.load_dotenv()
@@ -82,13 +102,62 @@ def parse_model_list(raw: str | None) -> list[str]:
     return [m.strip() for m in raw.split(",") if m.strip()]
 
 
-def make_llm(model: str, temperature: float = 0.3) -> GeneralLlm:
+def make_llm(
+    model: str, temperature: float = 0.3, purpose: str = "default"
+) -> GeneralLlm:
+    if is_claude_cli(model):
+        return ClaudeCliLlm(
+            model,
+            mode=RESEARCH if purpose == "researcher" else PLAIN,
+            temperature=temperature,
+            allowed_tries=2,
+        )
     return GeneralLlm(
         model=model,
         temperature=temperature,
         timeout=120,
         allowed_tries=2,
     )
+
+
+MODEL_SETTINGS = ("FORECASTER_MODELS", "RESEARCHER_MODEL", "SUMMARIZER_MODEL", "PARSER_MODEL")
+
+
+def uses_claude_cli() -> bool:
+    """True if any model setting names a claude-cli model."""
+    return any(
+        "claude-cli/" in (_env(var) or "") for var in MODEL_SETTINGS
+    )
+
+
+def check_claude_cli_config(run_mode: str, publish: bool) -> None:
+    """With claude-cli models, every setting must be one and the run must be a
+    local dry run on the bot-testing area. Raises ClaudeCliRefused otherwise."""
+    refuse_in_ci()
+    if publish:
+        raise ClaudeCliRefused(
+            "claude-cli models are for dry runs only. Add --dry-run, or use API-key models to publish."
+        )
+    if run_mode != "test_questions":
+        raise ClaudeCliRefused(
+            "claude-cli models run only on the bot-testing area (--mode test_questions). "
+            "Running on open tournament questions and then changing the bot breaks the tournament rules."
+        )
+    forecasters = parse_model_list(_env("FORECASTER_MODELS"))
+    problems = []
+    if not forecasters or not all(is_claude_cli(m) for m in forecasters):
+        problems.append("FORECASTER_MODELS")
+    researcher = _env("RESEARCHER_MODEL")
+    if not (researcher == "no_research" or is_claude_cli(researcher)):
+        problems.append("RESEARCHER_MODEL (claude-cli/... or no_research)")
+    for var in ("SUMMARIZER_MODEL", "PARSER_MODEL"):
+        if not is_claude_cli(_env(var)):
+            problems.append(var)
+    if problems:
+        raise ClaudeCliRefused(
+            "With claude-cli models, every model setting must be a claude-cli model, so no "
+            "library default is used. Set: " + ", ".join(problems)
+        )
 
 
 def llms_from_env() -> dict[str, str | GeneralLlm]:
@@ -106,6 +175,11 @@ def llms_from_env() -> dict[str, str | GeneralLlm]:
         if not value:
             continue
         # asknews/... and smart-searcher/... are strategy names, not LLMs.
+        if purpose == "researcher" and "claude-cli/" in value and not is_claude_cli(value):
+            raise ClaudeCliRefused(
+                f"RESEARCHER_MODEL={value}: a search strategy would call claude-cli outside "
+                "the backend. Use claude-cli/<model id> directly."
+            )
         if purpose == "researcher" and (
             value.startswith("asknews/")
             or value.startswith("smart-searcher/")
@@ -113,7 +187,7 @@ def llms_from_env() -> dict[str, str | GeneralLlm]:
         ):
             llms[purpose] = value
         else:
-            llms[purpose] = make_llm(value, temperature=0.1)
+            llms[purpose] = make_llm(value, temperature=0.1, purpose=purpose)
     return llms
 
 
@@ -126,6 +200,47 @@ class CkaiBot(FallTemplateBot2026):
             make_llm(m) for m in (forecaster_models or [])
         ]
         self._next_forecaster = 0
+        self._claude_cli = any(
+            is_claude_cli(llm) for llm in [*self._llms.values(), *self._forecasters]
+        )
+        if self._claude_cli:
+            self._check_claude_cli_bot()
+
+    def _check_claude_cli_bot(self) -> None:
+        """Checked after the library has filled in defaults, so none can slip in."""
+        refuse_in_ci()
+        if self.publish_reports_to_metaculus:
+            raise ClaudeCliRefused("claude-cli models are for dry runs only; publishing is on.")
+        # Instances only: a bare "claude-cli/..." string would become a plain
+        # GeneralLlm in the library and go through litellm.
+        not_cli = [
+            purpose
+            for purpose, llm in self._llms.items()
+            if not (
+                isinstance(llm, ClaudeCliLlm)
+                or (purpose == "researcher" and llm == "no_research")
+            )
+        ]
+        not_cli += [llm.model for llm in self._forecasters if not isinstance(llm, ClaudeCliLlm)]
+        if not_cli:
+            raise ClaudeCliRefused(
+                "With claude-cli models, every model must be one. Not claude-cli: "
+                + ", ".join(not_cli)
+            )
+
+    async def forecast_questions(self, questions: Sequence[MetaculusQuestion], *args, **kwargs):  # type: ignore[override]
+        if self._claude_cli:
+            # Checked again here: publishing could have been switched on after the bot was built.
+            self._check_claude_cli_bot()
+            outside = [
+                q.page_url for q in questions if set(q.tournament_slugs) != {"bot-testing-area"}
+            ]
+            if outside:
+                raise ClaudeCliRefused(
+                    "claude-cli models run only on questions in the bot-testing area and "
+                    "nowhere else. Not allowed: " + ", ".join(str(u) for u in outside[:5])
+                )
+        return await super().forecast_questions(questions, *args, **kwargs)
 
     def _pick_forecaster(self) -> GeneralLlm | None:
         if not self._forecasters:
@@ -203,12 +318,28 @@ def main() -> None:
         action="store_true",
         help="Forecast without publishing anything to Metaculus",
     )
+    parser.add_argument(
+        "--max-questions",
+        type=int,
+        default=None,
+        help="test_questions mode only: forecast this many bot-testing-area questions",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
     dry_run = args.dry_run or (_env("DRY_RUN") or "").lower() in TRUE_VALUES
     publish = not dry_run
+    if args.max_questions is not None and (run_mode != "test_questions" or args.max_questions < 1):
+        parser.error("--max-questions needs --mode test_questions and a number of at least 1")
 
-    check_environment(strict=True)
+    if uses_claude_cli():
+        try:
+            check_claude_cli_config(run_mode, publish)
+        except ClaudeCliRefused as exc:
+            sys.exit(f"Refused: {exc}")
+        if not _env("METACULUS_TOKEN"):
+            sys.exit("METACULUS_TOKEN is missing; it's needed to read the bot-testing-area questions.")
+    else:
+        check_environment(strict=True)
     print_startup_banner(run_mode, will_publish=publish)
 
     forecaster_models = parse_model_list(_env("FORECASTER_MODELS"))
@@ -225,6 +356,47 @@ def main() -> None:
     bot = build_bot(publish, forecaster_models)
     client = MetaculusClient()
 
+    # SIGTERM and SIGHUP (closing the terminal) take the same path as Ctrl-C,
+    # so claude processes, which run in their own process groups, get stopped.
+    if uses_claude_cli():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _interrupt)
+    try:
+        reports = _run(bot, client, run_mode, args.max_questions)
+    except KeyboardInterrupt:
+        kill_running_calls()
+        raise
+
+    bot.log_report_summary(reports)
+    print_run_summary_banner(
+        reports,
+        will_publish=publish,
+        tournament_url=TOURNAMENT_URLS.get(run_mode),
+    )
+
+
+def _interrupt(signum, frame) -> None:  # noqa: ARG001
+    raise KeyboardInterrupt
+
+
+def pick_questions(questions: Sequence[MetaculusQuestion], n: int) -> list[MetaculusQuestion]:
+    """Up to n questions, taking one of each question type in turn. Skips
+    conditional questions, which cost several predictions each."""
+    by_type: dict[str, list[MetaculusQuestion]] = {}
+    for q in questions:
+        if isinstance(q, ConditionalQuestion):
+            continue
+        by_type.setdefault(type(q).__name__, []).append(q)
+    picked: list[MetaculusQuestion] = []
+    queues = [list(v) for _, v in sorted(by_type.items())]
+    while len(picked) < n and any(queues):
+        for queue in queues:
+            if queue and len(picked) < n:
+                picked.append(queue.pop(0))
+    return picked
+
+
+def _run(bot: CkaiBot, client: MetaculusClient, run_mode: str, max_questions: int | None) -> list:
     if run_mode == "tournament":
         reports = asyncio.run(
             bot.forecast_on_tournament(
@@ -241,18 +413,24 @@ def main() -> None:
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
         )
+    elif max_questions is not None:
+        bot.skip_previously_forecasted_questions = False
+        # Fetched outside asyncio.run: the client runs its own event loop.
+        questions = client.get_all_open_questions_from_tournament("bot-testing-area")
+        picked = pick_questions(questions, max_questions)
+        logger.info(
+            "Forecasting %d of %d bot-testing-area questions: %s",
+            len(picked),
+            len(questions),
+            [(type(q).__name__, q.page_url) for q in picked],
+        )
+        reports = asyncio.run(bot.forecast_questions(picked, return_exceptions=True))
     else:
         bot.skip_previously_forecasted_questions = False
         reports = asyncio.run(
             bot.forecast_on_tournament("bot-testing-area", return_exceptions=True)
         )
-
-    bot.log_report_summary(reports)
-    print_run_summary_banner(
-        reports,
-        will_publish=publish,
-        tournament_url=TOURNAMENT_URLS.get(run_mode),
-    )
+    return reports
 
 
 if __name__ == "__main__":

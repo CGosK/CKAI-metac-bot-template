@@ -1,0 +1,5 @@
+{
+  "allow": [
+    {"path": "pyproject.toml", "label": "email", "reason": "Upstream template author's address, already public in Metaculus's metac-bot-template"}
+  ]
+}

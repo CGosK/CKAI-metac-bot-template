@@ -15,9 +15,31 @@ This fork runs `ckai_bot.py`, a thin layer on Metaculus's template bot (`main.py
 3. **Enable Actions** on the Actions tab.
 4. **Dry run:** Actions → Test Bot → Run workflow, leaving "Dry run" ticked. Download the `forecast-reports` artifact to read what it would have posted.
 5. **Live test:** run Test Bot again with "Dry run" unticked. It posts to Metaculus's unscored bot-testing area.
-6. **January:** uncomment the schedule in `.github/workflows/run_bot_on_tournament.yaml` once the season opens.
+6. **January:** first merge Metaculus's template update for the new season. Tournament mode reads the tournament ID from the pinned `forecasting-tools` version, so without the update it targets the old season. Then uncomment the schedule in `.github/workflows/run_bot_on_tournament.yaml`.
 
 Tournament rule: you may not run the bot on open or upcoming tournament questions, look at its output and then change the bot. Iterate on the bot-testing area or closed questions instead.
+
+## Local development on a Claude subscription
+
+While building, the bot can run its model calls through headless Claude Code on your own Claude subscription instead of an API key. Name models `claude-cli/<full model id>` in a local `.env` (gitignored), for example:
+
+```
+METACULUS_TOKEN=...
+RKIT_PATH=<path to the research kit that holds rkit/>
+FORECASTER_MODELS=claude-cli/claude-opus-5-5,claude-cli/claude-sonnet-5-5
+RESEARCHER_MODEL=claude-cli/claude-sonnet-5-5
+SUMMARIZER_MODEL=claude-cli/claude-haiku-5-5
+PARSER_MODEL=claude-cli/claude-haiku-5-5
+```
+
+Then: `uv run python ckai_bot.py --mode test_questions --dry-run --max-questions 3`
+
+- Every call goes through rkit's runner (`claude_cli_llm.py`): a clean environment, the personal Claude config, and a usage guard that pauses before extra usage would be used. Without rkit the backend refuses to run.
+- Research gets only WebSearch and WebFetch. Forecasting, summarising and parsing get no tools.
+- It refuses to run in CI, to publish, outside the bot-testing area, or unless every model setting is a `claude-cli/` model, so no library default slips in.
+- Call logs go to `~/.cache/ckai-bot-runs/`.
+
+This is for development dry runs only. The live bot uses API keys.
 
 ---
 
