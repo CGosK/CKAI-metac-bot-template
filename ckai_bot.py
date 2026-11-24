@@ -157,15 +157,20 @@ THINKING_SHARE = {
     "max": Fraction("0.95"),
 }
 MIN_ANSWER_TOKENS = 4000  # room the template's rationale and final answer need
+MIN_THINKING_BUDGET = 1024  # OpenRouter's floor on the thinking budget
 MAX_TOKENS_LIMIT = 128000
 DEFAULT_MAX_TOKENS = 32000
 DEFAULT_MAX_TOKENS_EFFORTS = ("low", "medium", "high")
 
 
 def min_max_tokens(effort: str | None) -> int:
-    """The smallest cap that leaves MIN_ANSWER_TOKENS after the thinking budget."""
-    answer_share = 1 - THINKING_SHARE[effort or "none"]
-    return -(-MIN_ANSWER_TOKENS // answer_share)  # ceiling division on a Fraction
+    """The smallest cap that leaves MIN_ANSWER_TOKENS after the thinking budget,
+    which OpenRouter sets to max(cap * share, MIN_THINKING_BUDGET)."""
+    share = THINKING_SHARE[effort or "none"]
+    if share == 0:
+        return MIN_ANSWER_TOKENS
+    by_share = int(-(-MIN_ANSWER_TOKENS // (1 - share)))  # ceiling division on a Fraction
+    return max(by_share, MIN_ANSWER_TOKENS + MIN_THINKING_BUDGET)
 
 
 def forecaster_max_tokens(effort: str | None) -> int | None:
@@ -174,8 +179,8 @@ def forecaster_max_tokens(effort: str | None) -> int | None:
     raw = _env("FORECASTER_MAX_TOKENS")
     if raw is None:
         return DEFAULT_MAX_TOKENS if effort in DEFAULT_MAX_TOKENS_EFFORTS else None
-    minimum = int(min_max_tokens(effort))
-    if not raw.isdigit() or not minimum <= int(raw) <= MAX_TOKENS_LIMIT:
+    minimum = min_max_tokens(effort)
+    if not (raw.isascii() and raw.isdigit()) or not minimum <= int(raw) <= MAX_TOKENS_LIMIT:
         raise ValueError(
             f"FORECASTER_MAX_TOKENS={raw!r}: use a whole number from {minimum} to "
             f"{MAX_TOKENS_LIMIT} (at REASONING_EFFORT={effort or 'unset'}, smaller caps leave "
@@ -191,11 +196,18 @@ class CappedForecasterLlm(GeneralLlm):
 
     async def _call_litellm(self, prompt):
         start = time.monotonic()
-        response = await super()._call_litellm(prompt)
+        try:
+            response = await super()._call_litellm(prompt)
+        except BaseException as exc:
+            logger.info(
+                f"Forecaster call {self.model}: failed after {time.monotonic() - start:.0f}s "
+                f"({type(exc).__name__}), cap {self.litellm_kwargs.get('max_tokens')}"
+            )
+            raise
         seconds = time.monotonic() - start
         try:
             finish_reason = response.choices[0].finish_reason
-        except (AttributeError, IndexError):
+        except (AttributeError, IndexError, TypeError):
             finish_reason = None
         usage = getattr(response, "usage", None)
         completion = getattr(usage, "completion_tokens", None)

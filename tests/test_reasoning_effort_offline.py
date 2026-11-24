@@ -183,7 +183,7 @@ def test_setting_without_effort_keeps_temperature(monkeypatch, captured_requests
 
 @pytest.mark.parametrize(
     ("effort", "minimum"),
-    [(None, 4000), ("none", 4000), ("minimal", 4445), ("low", 5000), ("medium", 8000),
+    [(None, 4000), ("none", 4000), ("minimal", 5024), ("low", 5024), ("medium", 8000),
      ("high", 20000), ("xhigh", 80000), ("max", 80000)],
 )
 def test_minimum_leaves_room_for_the_answer(monkeypatch, effort, minimum):
@@ -196,7 +196,9 @@ def test_minimum_leaves_room_for_the_answer(monkeypatch, effort, minimum):
         ckai_bot.make_forecaster(OPUS)
 
 
-@pytest.mark.parametrize("value", ["abc", "0", "-5000", "1.5", "32000.0", "128001"])
+@pytest.mark.parametrize(
+    "value", ["abc", "0", "-5000", "1.5", "32000.0", "128001", "\uff13\uff12\uff10\uff10\uff10", "32000\u00b2"]
+)
 def test_invalid_cap_is_refused(monkeypatch, value):
     monkeypatch.setenv("FORECASTER_MAX_TOKENS", value)
     with pytest.raises(ValueError, match="FORECASTER_MAX_TOKENS"):
@@ -221,7 +223,7 @@ def test_cap_only_on_openrouter_forecasters(monkeypatch, caplog):
     cli = ckai_bot.make_forecaster("claude-cli/claude-test-1")
     assert isinstance(cli, ClaudeCliLlm)
     assert "max_tokens" not in cli.litellm_kwargs
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("WARNING", logger="ckai_bot"):
         direct = ckai_bot.make_forecaster("anthropic/claude-test-opus")
     assert "max_tokens" not in direct.litellm_kwargs
     assert "openrouter/ models only" in caplog.text
@@ -236,3 +238,18 @@ def test_truncated_answer_is_flagged(monkeypatch, captured_requests, caplog, fin
     assert "Forecaster call openrouter/anthropic/claude-test-opus" in caplog.text
     assert f"finish_reason {finish_reason}" in caplog.text
     assert ("answer was cut off" in caplog.text) is warned
+
+
+def test_failed_call_is_logged(monkeypatch, caplog):
+    from litellm.llms.custom_httpx import http_handler
+
+    async def timeout(self, url, *args, **kwargs):
+        raise httpx.ReadTimeout("offline timeout", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(http_handler.AsyncHTTPHandler, "post", timeout)
+    monkeypatch.setenv("REASONING_EFFORT", "high")
+    llm = ckai_bot.make_forecaster(OPUS)
+    with caplog.at_level("INFO", logger="ckai_bot"), pytest.raises(Exception):
+        asyncio.run(llm._call_litellm("Will it rain?"))
+    assert "Forecaster call openrouter/anthropic/claude-test-opus: failed after" in caplog.text
+    assert "cap 32000" in caplog.text
