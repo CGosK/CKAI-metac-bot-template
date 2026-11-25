@@ -8,6 +8,7 @@ Run with:  uv run --with pytest python -m pytest tests -q
 from __future__ import annotations
 
 import argparse
+import json
 import asyncio
 import os
 import sys
@@ -615,7 +616,8 @@ def test_resume_refuses_changed_round3_settings():
     from backtest import run
 
     def ns(**kw):
-        base = dict(forecaster="claude-cli/claude-opus-5-5", effort="high", prompt="template")
+        base = dict(forecaster="claude-cli/claude-opus-5-5", effort="high", prompt="template", evidence=False,
+                    reverse=False)
         base.update(kw)
         return argparse.Namespace(**base)
 
@@ -647,3 +649,87 @@ def test_configure_env_sets_effort_for_forecaster_only(monkeypatch):
     assert claude_cli_llm.PLAIN_TIMEOUT == 25 * 60
     assert os.environ["PROMPT_VERSION"] == "v2"
     assert os.environ["FORECASTER_MODELS"] == "claude-cli/claude-sonnet-5-5"
+
+
+def test_round4_combination_and_reconcile_parsing():
+    from prompts_r4 import combine_both_directions, parse_reconciled, reconcile_prompt
+
+    assert combine_both_directions(0.2, 0.6) == pytest.approx(0.3)
+    assert combine_both_directions(0.9, 0.1) == pytest.approx(0.9)
+    got = parse_reconciled('Sure.\n{"a": 0.3, "b": 45, "c": 0}', ["a", "b", "c"])
+    assert got == {"a": 0.3, "b": 0.45, "c": 0.01}
+    with pytest.raises(ValueError):
+        parse_reconciled('{"a": 0.3}', ["a", "b"])
+    with pytest.raises(ValueError):
+        parse_reconciled('{"a": -2}', ["a"])
+    text = reconcile_prompt([{"id": "a", "question": "Q1?", "criteria": "C1", "forecast": 0.25, "reasoning": "R1"},
+                             {"id": "b", "question": "Q2?", "criteria": "C2", "forecast": 0.5, "reasoning": "R2"}],
+                            "2026-09-01")
+    assert "Today is 2026-09-01." in text and "Forecast: 0.250" in text and '"b": <probability 0-1>' in text
+
+
+def test_round4_groups_need_same_group_and_freeze():
+    from backtest import round4
+
+    qs = [{"id": "a", "group": "g", "freeze_datetime": "2026-09-01"},
+          {"id": "b", "group": "g", "freeze_datetime": "2026-09-01"},
+          {"id": "c", "group": "g", "freeze_datetime": "2026-09-15"},
+          {"id": "d", "group": "h", "freeze_datetime": "2026-09-01"}]
+    assert [[q["id"] for q in g] for g in round4.groups(qs)] == [["a", "b"]]
+
+
+def test_compare_splits_by_outcome():
+    qs, base = scored_questions(20)
+    result = score.compare(qs, base, {i: v[:3] for i, v in base.items()}, 3, base_k=3)
+    split = result["by_outcome"]
+    assert split["resolved_yes"]["n"] + split["resolved_no"]["n"] == 20
+
+
+def test_missing_ks_retries_the_failed_middle_k():
+    assert run.missing_ks(set(), 3) == [0, 1, 2]
+    assert run.missing_ks({0, 2}, 3) == [1]
+    assert run.missing_ks({0, 1, 2}, 3) == []
+    assert run.missing_ks({0, 1}, 3) == [2]
+
+
+def _fake_batch(root, name, launch: dict, rows: list[dict]):
+    d = root / name
+    d.mkdir()
+    (d / "launch.txt").write_text("".join(f"{k}: {v}\n" for k, v in launch.items()) + "\n")
+    (d / "predictions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_round4_combine_pairs_and_guards(monkeypatch, tmp_path):
+    from backtest import round4
+
+    monkeypatch.setattr(run, "RUNS", tmp_path)
+    monkeypatch.setattr(round4, "write_launch", lambda path, lines: (path / "launch.txt").write_text("x"))
+    base = {"questions_sha256": "abc", "forecaster": "claude-cli/claude-opus-5-5", "research": "wikipedia"}
+    _fake_batch(tmp_path, "yes", base, [{"id": "a", "k": 0, "prediction": 0.2},
+                                        {"id": "a", "k": 1, "prediction": None},
+                                        {"id": "a", "k": 1, "prediction": 0.4}])
+    rev = {**base, "research": "joined", "joined_from": "runs/yes/research.jsonl (sha256 x)",
+           "reverse": "P(No) asked (round 4, X1)"}
+    _fake_batch(tmp_path, "no", rev, [{"id": "a", "k": 0, "prediction": 0.6}, {"id": "a", "k": 1, "prediction": 0.5}])
+    round4.combine("yes", "no", "both")
+    got = [json.loads(ln) for ln in (tmp_path / "both" / "predictions.jsonl").read_text().splitlines()]
+    assert [round(r["prediction"], 3) for r in got] == [0.3, 0.45]
+    alone = [json.loads(ln) for ln in (tmp_path / "both-no-only" / "predictions.jsonl").read_text().splitlines()]
+    assert [round(r["prediction"], 3) for r in alone] == [0.4, 0.5]
+    with pytest.raises(SystemExit):  # never overwrites
+        round4.combine("yes", "no", "both")
+    _fake_batch(tmp_path, "no2", {**rev, "effort": "max (forecaster, claude --effort)"}, [])
+    with pytest.raises(SystemExit, match="effort"):
+        round4.combine("yes", "no2", "both2")
+    with pytest.raises(SystemExit, match="reverse"):
+        round4.combine("no", "yes", "both3")
+
+
+def test_score_refuses_a_reverse_batch(monkeypatch, tmp_path):
+    meta = json.loads(score.QUESTIONS.read_text()) if score.QUESTIONS.exists() else None
+    if meta is None:
+        pytest.skip("no local question list")
+    monkeypatch.setattr(score, "RUNS", tmp_path)
+    _fake_batch(tmp_path, "rev", {"questions_sha256": meta["sha256"], "reverse": "P(No) asked (round 4, X1)"}, [])
+    with pytest.raises(SystemExit, match="P\\(No\\)"):
+        score.load(["rev"])

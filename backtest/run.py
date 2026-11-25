@@ -46,6 +46,7 @@ COMBO_SOURCES = ("research2", "wiki")  # stored AskNews and Wikipedia research
 ROUND2_PLAN = ROOT / "benchmarks" / "PLAN-refine-round2.md"
 ROUND2_AMEND = ROOT / "benchmarks" / "PLAN-refine-round2-amend1.md"
 ROUND3_PLAN = ROOT / "benchmarks" / "PLAN-refine-round3.md"
+ROUND4_PLAN = ROOT / "benchmarks" / "PLAN-refine-round4.md"
 # Forecasters the backtest may use, with their stated training cutoffs. Freezes start Aug 1, 2026.
 FORECASTERS = {
     "claude-cli/claude-opus-5-5": "Opus 5.5 training cutoff stated as June 2026 (Claude Code model information)",
@@ -120,7 +121,7 @@ def to_question(q: dict):
     )
 
 
-def configure_env(effort: str = DEFAULT_EFFORT, prompt: str = "template") -> None:
+def configure_env(effort: str = DEFAULT_EFFORT, prompt: str = "template", evidence: bool = False) -> None:
     import claude_cli_llm
 
     claude_cli_llm.PLAIN_SYSTEM_PROMPT = BACKTEST_SYSTEM_PROMPT
@@ -133,6 +134,7 @@ def configure_env(effort: str = DEFAULT_EFFORT, prompt: str = "template") -> Non
     os.environ["SUMMARIZER_MODEL"] = HELPER
     os.environ["PARSER_MODEL"] = HELPER
     os.environ["PROMPT_VERSION"] = prompt
+    os.environ["PROMPT_EVIDENCE"] = "on" if evidence else "off"
     for name in ("REASONING_EFFORT", "FORECASTER_MAX_TOKENS", "PREDICTIONS_PER_QUESTION"):
         os.environ.pop(name, None)
 
@@ -154,6 +156,8 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         plan = WIKI_PLAN
     if round3(args):
         plan = ROUND3_PLAN
+    if args.evidence or args.reverse:
+        plan = ROUND4_PLAN
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
     lines = {
         "command": " ".join(shlex.quote(a) for a in sys.argv),
@@ -176,6 +180,9 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         "prompt_version": args.prompt,
         "prompt_sha256": _sha256(ROOT / "prompts_v2.py") if args.prompt == "v2" else "template (main.py)",
         "plain_timeout_s": __import__("claude_cli_llm").PLAIN_TIMEOUT,
+        "prompt_evidence": "on" if args.evidence else "off",
+        "reverse": "P(No) asked (round 4, X1)" if args.reverse else "off",
+        "prompts_r4_sha256": _sha256(ROOT / "prompts_r4.py") if (args.evidence or args.reverse) else "unused",
         "freeze_from": meta["freeze_from"],
         "start": args.start,
         "limit": args.limit,
@@ -248,7 +255,33 @@ def check_resume_settings(first_launch: str, args: argparse.Namespace) -> str | 
         return "--prompt differs from this batch's first launch."
     if args.prompt == "v2" and lines.get("prompt_sha256") != _sha256(ROOT / "prompts_v2.py"):
         return "prompts_v2.py changed since this batch's first launch."
+    if lines.get("prompt_evidence", "off") != ("on" if args.evidence else "off"):
+        return "--evidence differs from this batch's first launch."
+    if (lines.get("reverse", "off") != "off") != args.reverse:
+        return "--reverse differs from this batch's first launch."
+    if (args.evidence or args.reverse) and lines.get("prompts_r4_sha256") != _sha256(ROOT / "prompts_r4.py"):
+        return "prompts_r4.py changed since this batch's first launch."
     return None
+
+
+def done_ks(path: Path) -> dict[str, set[int]]:
+    """The k values with a saved prediction, per question."""
+    out: dict[str, set[int]] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("prediction") is not None and row.get("k") is not None:
+                out.setdefault(row["id"], set()).add(row["k"])
+    return out
+
+
+def missing_ks(have: set[int], predictions: int) -> list[int]:
+    """The k values still to run: the unused ones, so a failed middle k is retried under its own number."""
+    need = predictions - len(have)
+    return [k for k in range(predictions + len(have)) if k not in have][:max(need, 0)]
 
 
 def done_counts(path: Path) -> dict[str, int]:
@@ -335,7 +368,7 @@ async def forecast_one(bot, q: dict, k: int, research: str = "") -> dict:
 
 async def run_batch(
     questions: list[dict], batch_dir: Path, predictions: int, parallel: int, research_mode: str = "none",
-    sources: list[str] | None = None, lookback_days: int | None = None,
+    sources: list[str] | None = None, lookback_days: int | None = None, reverse: bool = False,
 ) -> None:
     """predictions=0 with a research mode fetches and stores research only."""
     import ckai_bot
@@ -347,8 +380,10 @@ async def run_batch(
     stops = (MetaculusBlocked, ClaudeCliRefused, ResearchStopped, WikiLeak, WikiStopped, GdeltStopped)
 
     bot = ckai_bot.build_bot(publish=False, forecaster_models=[FORECASTER])
+    bot._reverse_binary = reverse
     out = batch_dir / "predictions.jsonl"
     done = done_counts(out)
+    have_ks = done_ks(out)
     lock = asyncio.Lock()
     store = None
     if research_mode == "asknews-historical":
@@ -413,7 +448,7 @@ async def run_batch(
                                             "error": f"research: {type(exc).__name__}: {str(exc)[:500]}"}) + "\n")
                 print(f"research failed {q['id']}", flush=True)
                 return
-            for k in range(done.get(q["id"], 0), predictions):
+            for k in missing_ks(have_ks.get(q["id"], set()), predictions):
                 try:
                     row = await forecast_one(bot, q, k, research)
                 except stops:
@@ -497,6 +532,9 @@ def main() -> None:
                         help="the forecaster's Claude Code effort level")
     parser.add_argument("--prompt", default="template", choices=["template", "v2"],
                         help="binary prompt: the template's or prompts_v2.py")
+    parser.add_argument("--evidence", action="store_true", help="add the round-4 evidence-and-window step")
+    parser.add_argument("--reverse", action="store_true",
+                        help="ask for P(No) (round 4, X1); predictions are P(No), combined later")
     parser.add_argument("--research", default="none",
                         choices=["none", "asknews-historical", "wikipedia", "combined", "gdelt", "joined"])
     parser.add_argument("--sources", help="joined: batches whose stored research texts are joined, in order")
@@ -508,6 +546,8 @@ def main() -> None:
     parser.add_argument("--probe-research", action="store_true",
                         help="two AskNews calls for one question; prints the dates, saves nothing")
     args = parser.parse_args()
+    if args.evidence and args.reverse:
+        parser.error("--evidence and --reverse can't be combined (the step's 'No' would be the reversed No)")
     global FORECASTER
     FORECASTER = args.forecaster
     if args.dataset:  # a held-out list instead of questions.json
@@ -519,7 +559,7 @@ def main() -> None:
     refuse_in_ci()
     import ckai_bot  # noqa: F401  (loads .env, including RKIT_PATH)
 
-    configure_env(args.effort, args.prompt)
+    configure_env(args.effort, args.prompt, args.evidence)
     block_metaculus()
     if args.probe_date:
         asyncio.run(probe_date())
@@ -584,7 +624,8 @@ def main() -> None:
     install_date_stub()
     try:
         asyncio.run(run_batch(chosen, batch_dir, args.predictions, args.parallel, args.research,
-                              args.sources.split(",") if args.sources else None, args.lookback_days))
+                              args.sources.split(",") if args.sources else None, args.lookback_days,
+                              args.reverse))
     finally:
         from claude_cli_llm import get_backend
 

@@ -81,6 +81,9 @@ def load(batches: list[str]) -> tuple[dict, list[dict], dict[str, list[float]]]:
         launch = (RUNS / batch / "launch.txt").read_text()
         if f"questions_sha256: {meta['sha256']}" not in launch:
             sys.exit(f"{batch} was run on a different question list")
+        first = launch.split("\n\n")[0]
+        if any(ln.startswith("reverse: ") and ln != "reverse: off" for ln in first.splitlines()):
+            sys.exit(f"{batch} holds P(No) forecasts; combine it first (backtest.round4 combine)")
         for line in (RUNS / batch / "predictions.jsonl").read_text().splitlines():
             try:
                 row = json.loads(line)
@@ -324,6 +327,12 @@ def compare(
                 abs(statistics.median(base[i][:base_k]) - crowd[i]) for i in ids),
             "compared": statistics.fmean(abs(med[i] - crowd[i]) for i in ids),
         },
+    }
+    result["by_outcome"] = {
+        name: {"n": len(sel),
+               "baseline_brier": statistics.fmean(base_b[i] for i in sel) if sel else None,
+               "compared_brier": statistics.fmean(other_b[i] for i in sel) if sel else None}
+        for name, sel in (("resolved_yes", [i for i in ids if y[i]]), ("resolved_no", [i for i in ids if not y[i]]))
     }
     calibration = []
     for b in range(10):

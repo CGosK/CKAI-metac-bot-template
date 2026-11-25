@@ -403,6 +403,14 @@ def prompt_version() -> str:
     return value
 
 
+def prompt_evidence() -> bool:
+    """PROMPT_EVIDENCE: on adds the round-4 evidence-and-window step to binary prompts; off (default)."""
+    value = (_env("PROMPT_EVIDENCE") or "off").strip().lower()
+    if value not in ("on", "off"):
+        raise ValueError(f"PROMPT_EVIDENCE must be on or off, not {value!r}")
+    return value == "on"
+
+
 class LiveWiki:
     """Wikipedia research for one bot run.
 
@@ -489,6 +497,8 @@ class CkaiBot(FallTemplateBot2026):
         self._wiki: LiveWiki | None = None
         self._wiki_parts: dict[str, str] = {}
         self._prompt_version = prompt_version()
+        self._prompt_evidence = prompt_evidence()
+        self._reverse_binary = False  # backtest only (round 4, X1): ask for P(No) instead
         if self._wiki_mode != "off":
             helper = make_llm(
                 _env("WIKI_HELPER_MODEL") or DEFAULT_WIKI_HELPER, temperature=0, purpose="wiki_helper"
@@ -599,6 +609,15 @@ class CkaiBot(FallTemplateBot2026):
             self._get_conditional_disclaimer_if_necessary(question),
         )
         return await self._binary_prompt_to_forecast(question, prompt)
+
+    async def _binary_prompt_to_forecast(self, question, prompt: str):
+        from prompts_r4 import add_evidence_step, reverse_wrap
+
+        if self._prompt_evidence:
+            prompt = add_evidence_step(prompt)
+        if self._reverse_binary:
+            prompt = reverse_wrap(prompt)
+        return await super()._binary_prompt_to_forecast(question, prompt)
 
     def _pick_forecaster(self) -> GeneralLlm | None:
         if not self._forecasters:

@@ -226,3 +226,57 @@ def test_v2_prompt_differs_from_template_only_in_the_planned_lines(monkeypatch):
         ln for ln in v2 if not ln.startswith(V2_ONLY_PREFIXES)]
     assert all(ln in template for ln in TEMPLATE_ONLY)
     assert sum(ln.startswith(V2_ONLY_PREFIXES) for ln in v2) == len(V2_ONLY_PREFIXES)
+
+
+def _parent_prompt(monkeypatch, env: dict, reverse=False):
+    import ckai_bot
+    import main
+    from forecasting_tools import BinaryQuestion
+
+    for k in ("PROMPT_VERSION", "PROMPT_EVIDENCE"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    bot = ckai_bot.build_bot(publish=False, forecaster_models=MODELS)
+    bot._reverse_binary = reverse
+    seen = []
+
+    async def capture(self, question, prompt):
+        seen.append(prompt)
+        return None
+
+    monkeypatch.setattr(main.FallTemplateBot2026, "_binary_prompt_to_forecast", capture)
+    q = BinaryQuestion(question_text="Will X happen?", background_info="BG", resolution_criteria="CRIT",
+                       fine_print="FP", page_url="test:1")
+    asyncio.run(bot._run_forecast_on_binary(q, "RESEARCH TEXT"))
+    return seen[0]
+
+
+def test_evidence_step_off_by_default_and_added_when_on(monkeypatch):
+    from prompts_r4 import EVIDENCE_STEP
+
+    plain = _parent_prompt(monkeypatch, {})
+    assert "(i) The single fact" not in plain
+    for version in ("template", "v2"):
+        prompt = _parent_prompt(monkeypatch, {"PROMPT_EVIDENCE": "on", "PROMPT_VERSION": version})
+        assert EVIDENCE_STEP.strip().split("\n")[1] in prompt
+        assert prompt.index("(i) The single fact") < prompt.index("You write your rationale")
+        base = _parent_prompt(monkeypatch, {"PROMPT_VERSION": version})
+        added = [ln for ln in prompt.splitlines() if ln not in base.splitlines()]
+        assert added == EVIDENCE_STEP.strip().split("\n")
+
+
+def test_reverse_asks_for_no(monkeypatch):
+    prompt = _parent_prompt(monkeypatch, {}, reverse=True)
+    assert prompt.startswith("IMPORTANT: This task asks for the probability that the question below resolves NO")
+    assert "These criteria have not yet been satisfied" not in prompt
+    assert "Will X happen?" in prompt and "CRIT" in prompt and "RESEARCH TEXT" in prompt
+    assert prompt.rstrip().endswith('written as "Probability: ZZ%", 0-100.')
+
+
+def test_unknown_prompt_evidence_fails(monkeypatch):
+    import ckai_bot
+
+    monkeypatch.setenv("PROMPT_EVIDENCE", "maybe")
+    with pytest.raises(ValueError, match="PROMPT_EVIDENCE"):
+        ckai_bot.build_bot(publish=False, forecaster_models=MODELS)
