@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -241,3 +241,299 @@ def test_short_questions_are_listed():
     qs, preds = scored_questions(10)
     preds["q3"] = preds["q3"][:2]
     assert score.analyse(qs, preds, predictions=5)["questions_with_fewer_predictions"] == ["q3"]
+
+
+# Research (no AskNews calls)
+
+
+def test_research_windows_end_at_freeze():
+    from backtest import research
+
+    freeze = datetime.fromisoformat("2026-08-06T00:00:00+00:00")
+    w = {x["name"]: x for x in research.windows(freeze)}
+    end = int(freeze.timestamp())
+    assert w["latest"]["end_timestamp"] == w["knowledge"]["end_timestamp"] == end
+    assert end - w["latest"]["start_timestamp"] == 24 * 3600
+    assert end - w["knowledge"]["start_timestamp"] == 60 * 86400
+    assert (w["latest"]["method"], w["latest"]["n_articles"]) == ("nl", 6)
+    assert (w["knowledge"]["method"], w["knowledge"]["n_articles"]) == ("kw", 10)
+
+
+def test_articles_after_freeze_are_found():
+    from backtest import research
+
+    freeze = datetime.fromisoformat("2026-08-06T00:00:00+00:00")
+    arts = [{"pub_date": "2026-08-05T10:00:00Z"}, {"pub_date": "2026-08-07T10:00:00"}]
+    assert research.later_than(arts, freeze) == [arts[1]]
+
+
+def test_leak_and_market_flags():
+    from backtest import research
+
+    freeze = datetime.fromisoformat("2026-08-06T00:00:00+00:00")
+    clean = research.leak_flags("In July 2026 talks stalled. Polls close in 2026.", freeze)
+    assert clean["score"] == 0
+    leaky = research.leak_flags("On September 3, 2026 she was elected. Plans for 2027.", freeze)
+    assert leaky["later_months"] == ["september 2026"]
+    assert leaky["later_years"] == ["2027"]
+    assert leaky["outcome_words"] == ["was elected"]
+    assert research.market_flag("Polymarket odds put it at 60%") == ["odds", "polymarket"]
+    assert research.market_flag("No markets here") == []
+
+
+def test_empty_research_matches_the_library_text():
+    from backtest import research
+
+    assert research.format_research([]) == "Here are the relevant news articles:\n\nNo articles were found.\n\n"
+
+
+def test_research_is_fetched_once_and_reused(monkeypatch, tmp_path):
+    from backtest import research
+
+    calls = []
+
+    async def fake_fetch(question, freeze):
+        calls.append(question)
+        return {"text": f"news for {question}", "calls": [], "leak": {"score": 0}, "market_words": []}
+
+    monkeypatch.setattr(research, "fetch", fake_fetch)
+    monkeypatch.setattr(research, "PAUSE_SECONDS", 0)
+    q = {"id": "x", "question": "Q?", "freeze_datetime": "2026-08-06T00:00:00+00:00"}
+    path = tmp_path / "research.jsonl"
+
+    async def go(store):
+        return await store.get(q), await store.get(q)
+
+    assert asyncio.run(go(research.ResearchStore(path))) == ("news for Q?", "news for Q?")
+    assert asyncio.run(go(research.ResearchStore(path)))[0] == "news for Q?"  # read back on resume
+    assert calls == ["Q?"]
+
+
+def test_compare_is_paired_and_matched():
+    qs, base = scored_questions(20)
+    better = {q["id"]: ([0.9] * 3 if q["outcome"] else [0.1] * 3) for q in qs}
+    result = score.compare(qs, base, better, 3)
+    assert result["questions"] == 20
+    assert result["brier"]["baseline_median_of_k"] == pytest.approx(0.16)
+    assert result["brier"]["compared_median"] == pytest.approx(0.01)
+    assert result["gain"]["mean"] == pytest.approx(0.15) and result["passes"]
+    same = score.compare(qs, base, {i: v[:3] for i, v in base.items()}, 3)
+    assert same["gain"]["mean"] == pytest.approx(0) and not same["passes"]
+
+
+
+def test_compare_reads_wikipedia_flags():
+    qs, base = scored_questions(20)
+    other = {i: v[:3] for i, v in base.items()}
+    ids = [q["id"] for q in qs]
+    research = {i: {"text": "x", "leak": {"later_dates": [], "markets": []}} for i in ids}
+    research[ids[0]]["leak"]["later_dates"] = ["2026-11-03"]
+    research[ids[1]]["leak"]["markets"] = ["kalshi"]
+    result = score.compare(qs, base, other, 3, research)
+    assert result["exploratory_by_leak_flag"]["flagged"]["n"] == 1
+    assert result["exploratory_by_market_words"]["flagged"]["n"] == 1
+
+def test_fetch_drops_articles_after_freeze(monkeypatch):
+    """The filter works on the SDK's own article objects (pub_date, AnyUrl)."""
+    from asknews_sdk.dto.news import SearchResponse
+
+    from backtest import research
+
+    def article(url, pub):
+        return {"article_url": url, "pub_date": pub, "eng_title": "t", "summary": "s", "language": "en",
+                "source_id": "x", "article_id": "00000000-0000-0000-0000-000000000000",
+                "country": "US", "image_url": None, "title": "t", "keywords": [], "classification": "c",
+                "authors": [], "entities": {}, "domain_url": url, "page_rank": 1, "provocative": "low",
+                "reporting_voice": "Objective", "sentiment": 0, "continent": "Europe", "medium": "News", "as_string_key": "k"}
+
+    class FakeNews:
+        async def search_news(self, **kwargs):
+            payload = {"as_dicts": [article("https://a.example/1", "2026-08-05T00:00:00Z"),
+                                    article("https://a.example/2", "2026-08-09T00:00:00Z")],
+                       "as_string": "", "offset": 0}
+            return SearchResponse.model_validate(payload)  # real objects: AnyUrl, datetime
+
+    class FakeSDK:
+        def __init__(self, **kwargs):
+            self.news = FakeNews()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    import asknews_sdk
+
+    monkeypatch.setattr(asknews_sdk, "AsyncAskNewsSDK", FakeSDK)
+    monkeypatch.setattr(research, "PAUSE_SECONDS", 0)
+    monkeypatch.setattr(research, "format_research", lambda per_call: ",".join(str(len(x)) for x in per_call))
+    monkeypatch.setenv("ASKNEWS_API_KEY", "test-not-a-key")
+    freeze = datetime.fromisoformat("2026-08-06T00:00:00+00:00")
+    result = asyncio.run(research.fetch("Q?", freeze))
+    assert result["text"] == "1,1"  # one kept per call
+    assert [c["dropped_after_freeze"] for c in result["calls"]] == [1, 1]
+
+
+# Wikipedia research (fake API, no network, no model calls)
+
+
+class FakeWikiApi:
+    """Pages: title -> list of (timestamp, content), oldest first."""
+
+    def __init__(self, pages, redirects=None):
+        self.pages, self.redirects, self.requests = pages, redirects or {}, []
+
+    def get(self, params):
+        self.requests.append(params)
+        if params.get("list") == "logevents":
+            target = self.redirects.get(params["letitle"])
+            events = [{"timestamp": "2026-09-01T00:00:00Z", "params": {"target_title": target}}] if target else []
+            return {"query": {"logevents": events}}
+        title = params["titles"]
+        start = params["rvstart"]
+        revs = [(i, ts, c) for i, (ts, c) in enumerate(self.pages.get(title, [])) if ts <= start]
+        if not revs:
+            return {"query": {"pages": [{"title": title, "missing": True}]}}
+        i, ts, c = revs[-1]
+        return {"query": {"pages": [{"title": title, "revisions": [
+            {"revid": hash((title, i)) & 0xFFFFFF, "timestamp": ts, "slots": {"main": {"content": c}}}]}]}}
+
+
+T = datetime.fromisoformat("2026-08-06T00:00:00+00:00")
+
+
+@pytest.fixture
+def wiki(monkeypatch, tmp_path):
+    from backtest import wiki as w
+
+    monkeypatch.setattr(w, "CACHE", tmp_path / "cache")
+    return w
+
+
+def test_wiki_revision_at_freeze(wiki):
+    api = FakeWikiApi({"A": [("2026-07-01T00:00:00Z", "old"), ("2026-09-01T00:00:00Z", "new, after T")]})
+    rev = wiki.article_at("A", T, api)
+    assert rev["content"] == "old" and rev["timestamp"] <= "2026-08-06"
+
+
+def test_wiki_later_revision_stops_the_run(wiki):
+    with pytest.raises(wiki.WikiLeak):
+        wiki._check({"revid": 1, "timestamp": "2026-08-07T00:00:00Z"}, T)
+
+
+def test_wiki_redirect_followed_as_it_stood(wiki):
+    api = FakeWikiApi(
+        {"Old": [("2026-01-01T00:00:00Z", "#REDIRECT [[Then]]")],
+         "Then": [("2026-01-01T00:00:00Z", "content then")],
+         "Now": [("2026-01-01T00:00:00Z", "content now")]},
+        redirects={"Old": "Now"},
+    )
+    assert wiki.article_at("Old", T, api)["content"] == "content then"
+
+
+def test_wiki_moved_page_uses_todays_target_history(wiki):
+    # "Renamed" was created after T as a redirect; its target's history goes back before T.
+    # "Old name" was moved to "New name" after T; history moved with it. The title shown is the one at T.
+    api = FakeWikiApi({"New name": [("2026-05-01T00:00:00Z", "text at T")]}, redirects={"Old name": "New name"})
+    rev = wiki.article_at("Old name", T, api)
+    assert rev["content"] == "text at T" and rev["title"] == "Old name"
+
+
+def test_wiki_title_that_was_not_a_page_at_t_is_skipped(wiki):
+    assert wiki.article_at("Created later", T, FakeWikiApi({"Elsewhere": [("2026-01-01T00:00:00Z", "x")]})) is None
+
+
+def test_wiki_table_inside_infobox_and_caps(wiki):
+    text = wiki.to_text("{{Infobox x|results=\n{| class=wikitable\n! A !! B\n|-\n| 1 || 2\n|}\n}}")
+    assert "A\tB" in text and "1\t2" in text
+    assert wiki._words(wiki._cap("a\tb\nc d e f", 3)) == 4  # 3 words plus the marker
+    assert wiki._cap("a b", 5) == "a b"
+
+
+def test_wiki_row_headers_are_data(wiki):
+    text = wiki._table('{|\n! Pollster !! Lee\n|-\n! scope="row" | Abacus\n| 41%\n|}')
+    assert text.splitlines() == ["Pollster\tLee", "Abacus\t41%"]
+
+
+def test_wiki_missing_page_skipped(wiki):
+    assert wiki.article_at("Nothing", T, FakeWikiApi({})) is None
+
+
+def test_wiki_text_conversion(wiki):
+    text = wiki.to_text(
+        "{{Infobox election|election_date={{Start date|2026|10|27}}|candidate1=Ann Lee|image=x.png}}\n"
+        "The vote is on {{Start date|2026|10|27}}, about {{convert|5|km}} away.<ref>Source</ref>\n"
+        "{{Citation needed}}[[File:Map.png|thumb|A map]][[Category:Elections]]\n"
+        "{| class=\"wikitable\"\n! Pollster !! Date !! Lee !! Kim\n|-\n| Abacus || Jul 2026 || 41% || 38%\n|}\n"
+    )
+    assert "election_date: 2026-10-27" in text and "candidate1: Ann Lee" in text
+    assert "image" not in text
+    assert "The vote is on 2026-10-27, about 5 km away." in text
+    assert "Source" not in text and "Citation" not in text and "Map" not in text and "Elections" not in text
+    assert "Pollster\tDate\tLee\tKim" in text and "Abacus\tJul 2026\t41%\t38%" in text
+
+
+def test_wiki_sections_split(wiki):
+    secs = wiki.sections("Lead text\n== Background ==\nB\n=== Polls ===\nP\n== See also ==\nS")
+    assert [h for h, _ in secs] == ["Lead", "Background", "Polls", "See also"]
+
+
+def test_wiki_portal_items_keep_their_chain(wiki):
+    content = ("'''Armed conflicts'''\n*[[2026 Iran war]]\n**[[Strait of Hormuz]]\n"
+               "***Iran and [[Oman]] reach an agreement.\n*[[Cricket]] news item.\n")
+    items = wiki.portal_items(content)
+    assert items[0]["chain"] == ["2026 Iran war", "Strait of Hormuz"]
+    assert "Oman" in items[0]["text"] and "2026 Iran war" in items[0]["links"]
+    assert items[1]["chain"] == [] and "Cricket" in items[1]["links"]
+
+
+def test_wiki_leak_scan(wiki):
+    flags = wiki.leak_scan("Set for October 27, 2026. Held on 3 July 2026. Polymarket odds.", T)
+    assert flags["later_dates"] == ["2026-10-27"]
+    assert flags["markets"] == ["polymarket"]
+
+
+def test_wiki_research_end_to_end(wiki, monkeypatch):
+    portal = wiki.portal_title(T - timedelta(days=1))
+    api = FakeWikiApi({
+        "Hamilton election": [("2026-07-30T00:00:00Z", "Lead about the vote.\n== Opinion polls ==\nLee leads.\n"
+                                                       "== History ==\nOld stuff.")],
+        portal: [("2026-08-05T20:00:00Z", "*[[Hamilton election]]\n**Lee holds a rally.\n*Unrelated item.")],
+    })
+
+    def portal_revisions(freeze, api_=None):
+        rev = api.get({"titles": portal, "rvstart": wiki._iso(freeze)})["query"]["pages"][0]["revisions"][0]
+        return {portal: {"revid": rev["revid"], "timestamp": rev["timestamp"],
+                         "content": rev["slots"]["main"]["content"]}}
+
+    monkeypatch.setattr(wiki, "portal_revisions", portal_revisions)
+
+    class Helper:
+        prompts = []
+
+        async def invoke(self, prompt):
+            self.prompts.append(prompt)
+            if "article titles" in prompt:
+                return '{"titles": ["Hamilton election", "Not a page"], "keywords": ["Lee", "Hamilton"]}'
+            return "[]"
+
+    q = {"id": "x", "question": "Will Lee win in Hamilton?", "criteria": "C",
+         "freeze_datetime": T.isoformat()}
+    row = asyncio.run(wiki.research_for(q, Helper(), api))
+    assert "Wikipedia articles as they stood on 2026-08-06" in row["text"]
+    assert "Lee leads." in row["text"]  # a poll section is always included
+    assert "Old stuff" not in row["text"]
+    assert "Lee holds a rally." in row["text"] and "Unrelated" not in row["text"]
+    assert row["articles"][0]["timestamp"] == "2026-07-30T00:00:00Z"
+
+
+def test_wiki_helper_runs_without_tools():
+    """The title and section calls use plain mode, which the runner starts with no tools."""
+    import claude_cli_llm
+    from backtest import run as r
+
+    src = Path(r.__file__).read_text()
+    assert "ClaudeCliLlm(HELPER, mode=PLAIN" in src
+    assert "RESEARCH" not in src.split("wiki_fetch")[0].split("wikipedia")[-1]
+    assert claude_cli_llm.PLAIN != claude_cli_llm.RESEARCH

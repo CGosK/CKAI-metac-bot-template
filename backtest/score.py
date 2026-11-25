@@ -15,6 +15,12 @@ A positive "gain" means the alternative scores better (lower Brier).
 
 Usage:
     uv run python -m backtest.score pilot [main ...]
+    uv run python -m backtest.score pilot main --compare research --predictions 3
+
+With --compare, the one pre-registered comparison of PLAN-research-backtest.md:
+the compared batch's median of its predictions against the baseline batches'
+expected Brier of a median of the same number of their saved predictions,
+paired by question.
 """
 
 from __future__ import annotations
@@ -75,7 +81,10 @@ def load(batches: list[str]) -> tuple[dict, list[dict], dict[str, list[float]]]:
         if f"questions_sha256: {meta['sha256']}" not in launch:
             sys.exit(f"{batch} was run on a different question list")
         for line in (RUNS / batch / "predictions.jsonl").read_text().splitlines():
-            row = json.loads(line)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:  # a line cut short by a hard kill
+                continue
             if row.get("prediction") is None:
                 continue
             if seen_in.setdefault(row["id"], batch) != batch:
@@ -236,12 +245,107 @@ def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: i
     }
 
 
+def compare(
+    questions: list[dict], base: dict[str, list[float]], other: dict[str, list[float]], k: int,
+    research: dict[str, dict] | None = None,
+) -> dict:
+    """Paired gain of `other` (median of k) over `base` (expected median of k of
+    its saved predictions). Positive gain: `other` scores better."""
+    ids = [q["id"] for q in questions if len(other.get(q["id"], [])) >= k and len(base.get(q["id"], [])) >= 5]
+    full = [dict(q) for q in questions if q["id"] in ids]
+    cluster_of = clusters(full)
+    y = {q["id"]: q["outcome"] for q in full}
+    crowd = {q["id"]: q["crowd"] for q in full}
+    med = {i: statistics.median(other[i][:k]) for i in ids}
+    base_b = {i: subsample_brier(base[i][:5], k, y[i]) for i in ids}
+    other_b = {i: brier(med[i], y[i]) for i in ids}
+    diffs = {i: base_b[i] - other_b[i] for i in ids}
+    mean, lo, hi, p = group_bootstrap(diffs, cluster_of)
+    sizes: dict[str, int] = {}
+    for i in ids:
+        sizes[cluster_of[i]] = sizes.get(cluster_of[i], 0) + 1
+    biggest = max(sizes, key=sizes.get) if sizes else None
+    result = {
+        "questions": len(ids),
+        "left_out_too_few_predictions": sorted(q["id"] for q in questions if q["id"] not in ids),
+        "clusters": len(sizes),
+        "largest_cluster": sizes.get(biggest),
+        "brier": {
+            "baseline_median_of_k": statistics.fmean(base_b.values()),
+            "compared_median": statistics.fmean(other_b.values()),
+            "crowd": statistics.fmean(brier(crowd[i], y[i]) for i in ids),
+        },
+        "gain": {"mean": mean, "ci95": [lo, hi], "p": p},
+        # Pre-registered rule: gain at least 0.01 and the interval excludes 0.
+        "passes": mean >= 0.01 and lo > 0,
+        "mean_forecast": statistics.fmean(med.values()),
+        "yes_rate": statistics.fmean(y.values()),
+        "mean_abs_from_crowd": {
+            "baseline_median_of_5": statistics.fmean(abs(statistics.median(base[i][:5]) - crowd[i]) for i in ids),
+            "compared": statistics.fmean(abs(med[i] - crowd[i]) for i in ids),
+        },
+    }
+    calibration = []
+    for b in range(10):
+        lo_b, hi_b = b / 10, (b + 1) / 10
+        sel = [i for i in ids if lo_b <= med[i] < hi_b or (b == 9 and med[i] == 1)]
+        if sel:
+            calibration.append({"bin": f"{lo_b:.1f}-{hi_b:.1f}", "n": len(sel),
+                                "mean_forecast": statistics.fmean(med[i] for i in sel),
+                                "yes_rate": statistics.fmean(y[i] for i in sel)})
+    result["calibration"] = calibration
+    # Exploratory: without the largest cluster, and split by research flags.
+    if biggest is not None and len(sizes) > 1:
+        rest = {i: d for i, d in diffs.items() if cluster_of[i] != biggest}
+        m, l, h, pp = group_bootstrap(rest, cluster_of)
+        result["exploratory_without_largest_cluster"] = {"n": len(rest), "mean": m, "ci95": [l, h]}
+    if research:
+        def split(flag) -> dict:
+            out = {}
+            for label, sel in (("flagged", [i for i in ids if flag(research.get(i, {}))]),
+                               ("not_flagged", [i for i in ids if not flag(research.get(i, {}))])):
+                out[label] = {"n": len(sel), "mean_gain": statistics.fmean(diffs[i] for i in sel) if sel else None}
+            return out
+
+        # AskNews rows carry leak.score and market_words; Wikipedia rows carry
+        # leak.later_dates and leak.markets.
+        result["exploratory_by_leak_flag"] = split(
+            lambda r: r.get("leak", {}).get("score", 0) > 0 or bool(r.get("leak", {}).get("later_dates")))
+        result["exploratory_by_market_words"] = split(
+            lambda r: bool(r.get("market_words")) or bool(r.get("leak", {}).get("markets")))
+        result["no_articles"] = sum("No articles were found." in research.get(i, {}).get("text", "") for i in ids)
+        result["articles_dropped_after_freeze"] = sum(
+            c["dropped_after_freeze"] for i in ids for c in research.get(i, {}).get("calls", [])
+        )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("batches", nargs="+")
     parser.add_argument("--predictions", type=int, default=5)
+    parser.add_argument("--compare", help="batch to compare against the baseline batches")
     args = parser.parse_args()
     meta, questions, preds = load(args.batches)
+    if args.compare:
+        _, _, other = load([args.compare])
+        rpath = RUNS / args.compare / "research.jsonl"
+        research = {}
+        if rpath.exists():
+            for line in rpath.read_text().splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:  # a line cut short by a hard kill
+                    continue
+                research[row["id"]] = row
+        result = compare(questions, preds, other, args.predictions, research)
+        result["baseline"], result["compared"] = args.batches, args.compare
+        OUT.mkdir(exist_ok=True)
+        path = OUT / f"compare-{'+'.join(args.batches)}-vs-{args.compare}.json"
+        path.write_text(json.dumps(result, indent=1))
+        print(json.dumps(result, indent=1))
+        print(f"wrote {path}")
+        return
     result = analyse(questions, preds, args.predictions)
     result["batches"] = args.batches
     result["questions_sha256"] = meta["sha256"]
