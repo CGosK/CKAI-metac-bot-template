@@ -7,7 +7,9 @@ Run with:  uv run --with pytest python -m pytest tests -q
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -168,7 +170,7 @@ def test_existing_batch_is_not_overwritten(monkeypatch, tmp_path):
     monkeypatch.setattr(run, "QUESTIONS", questions)  # the real list is local data, not in the repo
     monkeypatch.setattr(run, "RUNS", tmp_path)
     monkeypatch.setattr(claude_cli_llm, "refuse_in_ci", lambda: None)
-    monkeypatch.setattr(run, "configure_env", lambda: None)
+    monkeypatch.setattr(run, "configure_env", lambda *a: None)
     monkeypatch.setattr(run, "block_metaculus", lambda: None)
     monkeypatch.setattr(sys, "argv", ["run", "--batch", "pilot"])
     with pytest.raises(SystemExit, match="never overwritten"):
@@ -590,3 +592,58 @@ def test_heldout_excludes_ids_groups_and_nearby_dates():
     kept, dropped = fetch.exclude_overlap(new, existing)
     assert [x["id"] for x in kept] == ["e", "f"]
     assert dropped == {"same_id": 1, "same_group": 1, "resolution_date_within_1_day": 1}
+
+
+def test_compare_reports_log_gain():
+    qs, base = scored_questions(20)
+    better = {q["id"]: ([0.9] * 3 if q["outcome"] else [0.1] * 3) for q in qs}
+    result = score.compare(qs, base, better, 3, base_k=3)
+    assert result["log_gain"]["mean"] > 0
+    same = score.compare(qs, base, {i: v[:3] for i, v in base.items()}, 3, base_k=3)
+    assert same["log_gain"]["mean"] == pytest.approx(0)
+
+
+def test_ensemble_is_median_of_model_medians():
+    a = {"x": [0.1, 0.2, 0.3], "y": [0.5, 0.5, 0.5]}
+    b = {"x": [0.6, 0.7, 0.8], "y": [0.5]}
+    c = {"x": [0.9, 0.9, 0.9], "y": [0.4, 0.4, 0.4]}
+    out = score.ensemble([a, b, c], 3)
+    assert out == {"x": [0.2, 0.7, 0.9]}  # y left out: b has too few predictions
+
+
+def test_resume_refuses_changed_round3_settings():
+    from backtest import run
+
+    def ns(**kw):
+        base = dict(forecaster="claude-cli/claude-opus-5-5", effort="high", prompt="template")
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    old = "forecaster: claude-cli/claude-opus-5-5\nresearch: wikipedia\n"  # a batch from before round 3
+    assert run.check_resume_settings(old, ns()) is None
+    assert "effort" in run.check_resume_settings(old, ns(effort="max"))
+    assert "prompt" in run.check_resume_settings(old, ns(prompt="v2"))
+    sha = run._sha256(run.ROOT / "prompts_v2.py")
+    new = ("forecaster: claude-cli/claude-fable-5-2\neffort: max (forecaster, claude --effort)\n"
+           f"prompt_version: v2\nprompt_sha256: {sha}\n")
+    assert run.check_resume_settings(new, ns(forecaster="claude-cli/claude-fable-5-2", effort="max", prompt="v2")) is None
+    changed = new.replace(sha, "0" * 64)
+    assert "changed" in run.check_resume_settings(changed, ns(forecaster="claude-cli/claude-fable-5-2", effort="max", prompt="v2"))
+    assert "forecaster" in run.check_resume_settings(new, ns(effort="max", prompt="v2"))
+    assert run.round3(ns(effort="max")) and not run.round3(ns())
+
+
+def test_configure_env_sets_effort_for_forecaster_only(monkeypatch):
+    import claude_cli_llm
+    from backtest import run
+
+    monkeypatch.setattr(claude_cli_llm, "PLAIN_EFFORT", {})
+    monkeypatch.setattr(claude_cli_llm, "PLAIN_TIMEOUT", 600)
+    monkeypatch.setattr(run, "FORECASTER", "claude-cli/claude-sonnet-5-5")
+    for name in ("FORECASTER_MODELS", "RESEARCHER_MODEL", "SUMMARIZER_MODEL", "PARSER_MODEL", "PROMPT_VERSION"):
+        monkeypatch.delenv(name, raising=False)
+    run.configure_env("max", "v2")
+    assert claude_cli_llm.PLAIN_EFFORT == {"claude-sonnet-5-5": "max"}
+    assert claude_cli_llm.PLAIN_TIMEOUT == 25 * 60
+    assert os.environ["PROMPT_VERSION"] == "v2"
+    assert os.environ["FORECASTER_MODELS"] == "claude-cli/claude-sonnet-5-5"

@@ -555,3 +555,26 @@ def test_config_refuses_placeholder_asknews_pair(monkeypatch):
     monkeypatch.setenv("ASKNEWS_SECRET", "REPLACE_ME")
     with pytest.raises(ckai_bot.ClaudeCliRefused, match="placeholder"):
         ckai_bot.check_claude_cli_config("test_questions", publish=False)
+
+
+@needs_rkit
+def test_effort_goes_only_to_the_named_model(stub, monkeypatch):
+    import claude_cli_llm
+
+    calls = stub("ok")
+    monkeypatch.setattr(claude_cli_llm, "PLAIN_EFFORT", {MODEL: "max"})
+    asyncio.run(claude_cli_llm.ClaudeCliLlm(CLI).invoke("hi"))
+    asyncio.run(claude_cli_llm.ClaudeCliLlm("claude-cli/claude-test-2").invoke("hi"))
+    first, second = (c["argv"] for c in calls())
+    assert first[first.index("--effort") + 1] == "max"
+    assert "--effort" not in second
+
+
+@needs_rkit
+def test_unknown_effort_is_refused(stub, monkeypatch):
+    import claude_cli_llm
+
+    stub("ok")
+    monkeypatch.setattr(claude_cli_llm, "PLAIN_EFFORT", {MODEL: "extreme"})
+    with pytest.raises(claude_cli_llm.ClaudeCliRefused, match="effort"):
+        claude_cli_llm.get_backend().runner(MODEL, claude_cli_llm.PLAIN)

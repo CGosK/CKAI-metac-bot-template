@@ -76,6 +76,10 @@ RESEARCH_SYSTEM_PROMPT = (
 
 DEFAULT_RUNS_DIR = "~/.cache/ckai-bot-runs"
 PLAIN_TIMEOUT = 10 * 60
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# Claude Code effort per model in plain mode, e.g. {"claude-opus-5-5": "max"}. Empty means the
+# settings file decides. The backtest sets it for the forecaster only.
+PLAIN_EFFORT: dict[str, str] = {}
 RESEARCH_TIMEOUT = 15 * 60
 
 
@@ -169,10 +173,14 @@ class _Backend:
                         log=logger.warning,
                     )
                 else:
+                    effort = PLAIN_EFFORT.get(model)
+                    if effort is not None and effort not in EFFORT_LEVELS:
+                        raise ClaudeCliRefused(f"Unknown effort level {effort!r}")
                     runner = Runner(
                         model,
                         self.state_path,
                         agentic=False,
+                        extra_args=("--effort", effort) if effort else (),
                         system_prompt=PLAIN_SYSTEM_PROMPT,
                         timeout=PLAIN_TIMEOUT,
                         log=logger.warning,

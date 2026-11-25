@@ -393,6 +393,16 @@ def llms_from_env() -> dict[str, str | GeneralLlm]:
     return llms
 
 
+def prompt_version() -> str:
+    """PROMPT_VERSION: template (default) or v2 (prompts_v2.py, binary questions only)."""
+    from prompts_v2 import PROMPT_VERSIONS
+
+    value = (_env("PROMPT_VERSION") or "template").strip().lower()
+    if value not in PROMPT_VERSIONS:
+        raise ValueError(f"PROMPT_VERSION must be one of {', '.join(PROMPT_VERSIONS)}, not {value!r}")
+    return value
+
+
 class LiveWiki:
     """Wikipedia research for one bot run.
 
@@ -478,6 +488,7 @@ class CkaiBot(FallTemplateBot2026):
         self._wiki_mode = wiki_research_mode()
         self._wiki: LiveWiki | None = None
         self._wiki_parts: dict[str, str] = {}
+        self._prompt_version = prompt_version()
         if self._wiki_mode != "off":
             helper = make_llm(
                 _env("WIKI_HELPER_MODEL") or DEFAULT_WIKI_HELPER, temperature=0, purpose="wiki_helper"
@@ -575,6 +586,19 @@ class CkaiBot(FallTemplateBot2026):
             if not research:
                 return "Research was Wikipedia articles only; not summarized."
         return await super().summarize_research(question, research)
+
+    async def _run_forecast_on_binary(self, question, research: str):
+        if self._prompt_version != "v2":
+            return await super()._run_forecast_on_binary(question, research)
+        import main
+        from prompts_v2 import binary_prompt_v2
+
+        prompt = binary_prompt_v2(
+            question.question_text, question.background_info, question.resolution_criteria,
+            question.fine_print, research, main.datetime.now().strftime("%Y-%m-%d"),
+            self._get_conditional_disclaimer_if_necessary(question),
+        )
+        return await self._binary_prompt_to_forecast(question, prompt)
 
     def _pick_forecaster(self) -> GeneralLlm | None:
         if not self._forecasters:

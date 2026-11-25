@@ -37,6 +37,7 @@ def offline_env(monkeypatch):
     monkeypatch.delenv("REASONING_EFFORT", raising=False)
     monkeypatch.delenv("WIKI_RESEARCH", raising=False)
     monkeypatch.delenv("WIKI_HELPER_MODEL", raising=False)
+    monkeypatch.delenv("PROMPT_VERSION", raising=False)
     yield
 
 
@@ -168,3 +169,60 @@ def test_ensemble_forecasts_every_question_type(monkeypatch, tmp_path):
 
     for report in reports:
         assert report.explanation.strip()
+
+
+def _captured_binary_prompt(monkeypatch, version, research="RESEARCH TEXT"):
+    import ckai_bot
+    from forecasting_tools import BinaryQuestion
+
+    if version is None:
+        monkeypatch.delenv("PROMPT_VERSION", raising=False)
+    else:
+        monkeypatch.setenv("PROMPT_VERSION", version)
+    bot = ckai_bot.build_bot(publish=False, forecaster_models=MODELS)
+    seen = []
+
+    async def capture(self, question, prompt):
+        seen.append(prompt)
+        return None
+
+    monkeypatch.setattr(ckai_bot.CkaiBot, "_binary_prompt_to_forecast", capture)
+    q = BinaryQuestion(question_text="Will X happen?", background_info="BG", resolution_criteria="CRIT",
+                       fine_print="FP", page_url="test:1")
+    asyncio.run(bot._run_forecast_on_binary(q, research))
+    return seen[0]
+
+
+def test_template_prompt_is_the_default(monkeypatch):
+    prompt = _captured_binary_prompt(monkeypatch, None)
+    assert "good forecasters put extra weight on the status quo outcome" in prompt
+    assert "reference class" not in prompt
+
+
+def test_v2_prompt_has_the_three_changes(monkeypatch):
+    prompt = _captured_binary_prompt(monkeypatch, "v2")
+    for text in ("Will X happen?", "BG", "CRIT", "FP", "RESEARCH TEXT", "Today is ",
+                 "readings of the resolution criteria", "reference class", "base rate",
+                 "only when the research covers the last few days", '"Probability: ZZ%", 0-100'):
+        assert text in prompt, text
+    assert "good forecasters put extra weight on the status quo outcome" not in prompt
+
+
+def test_unknown_prompt_version_fails(monkeypatch):
+    import ckai_bot
+
+    monkeypatch.setenv("PROMPT_VERSION", "v9")
+    with pytest.raises(ValueError, match="PROMPT_VERSION"):
+        ckai_bot.build_bot(publish=False, forecaster_models=MODELS)
+
+
+def test_v2_prompt_differs_from_template_only_in_the_planned_lines(monkeypatch):
+    from prompts_v2 import TEMPLATE_ONLY, V2_ONLY_PREFIXES
+
+    research = "Line one\n    indented line\n        deeper line\n\nlast"
+    template = _captured_binary_prompt(monkeypatch, None, research).splitlines()
+    v2 = _captured_binary_prompt(monkeypatch, "v2", research).splitlines()
+    assert [ln for ln in template if ln not in TEMPLATE_ONLY] == [
+        ln for ln in v2 if not ln.startswith(V2_ONLY_PREFIXES)]
+    assert all(ln in template for ln in TEMPLATE_ONLY)
+    assert sum(ln.startswith(V2_ONLY_PREFIXES) for ln in v2) == len(V2_ONLY_PREFIXES)

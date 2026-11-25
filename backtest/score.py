@@ -177,6 +177,18 @@ def subsample_brier(values: list[float], k: int, y: int) -> float:
     return statistics.fmean(brier(statistics.median(c), y) for c in combos)
 
 
+def subsample_log(values: list[float], k: int, y: int) -> float:
+    """Expected log score of the median of k predictions drawn from the saved ones."""
+    combos = list(itertools.combinations(values, k))
+    return statistics.fmean(log_score(statistics.median(c), y) for c in combos)
+
+
+def ensemble(batch_preds: list[dict[str, list[float]]], k: int) -> dict[str, list[float]]:
+    """Per question, each batch's median of its first k predictions; questions every batch has k for."""
+    ids = set.intersection(*(set(i for i, v in p.items() if len(v) >= k) for p in batch_preds))
+    return {i: [statistics.median(p[i][:k]) for p in batch_preds] for i in ids}
+
+
 def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: int) -> dict:
     full = [dict(q) for q in questions if len(preds[q["id"]]) >= predictions]
     short = sorted(q["id"] for q in questions if len(preds[q["id"]]) < predictions)
@@ -283,6 +295,9 @@ def compare(
     other_b = {i: brier(med[i], y[i]) for i in ids}
     diffs = {i: base_b[i] - other_b[i] for i in ids}
     mean, lo, hi, p = group_bootstrap(diffs, cluster_of)
+    # The tournament's score is log-based: lower log loss is better, so gain = baseline - compared.
+    log_diffs = {i: subsample_log(base[i][:base_k], k, y[i]) - log_score(med[i], y[i]) for i in ids}
+    lmean, llo, lhi, lp = group_bootstrap(log_diffs, cluster_of)
     sizes: dict[str, int] = {}
     for i in ids:
         sizes[cluster_of[i]] = sizes.get(cluster_of[i], 0) + 1
@@ -298,6 +313,7 @@ def compare(
             "crowd": statistics.fmean(brier(crowd[i], y[i]) for i in ids),
         },
         "gain": {"mean": mean, "ci95": [lo, hi], "p": p},
+        "log_gain": {"mean": lmean, "ci95": [llo, lhi], "p": lp},
         "rule": (f"gain >= {min_gain}" if min_gain is not None
                  else "gain >= 0.01 and 95% interval above 0"),
         "passes": (mean >= min_gain) if min_gain is not None else (mean >= 0.01 and lo > 0),
@@ -441,6 +457,8 @@ def main() -> None:
     parser.add_argument("--predictions", type=int, default=5)
     parser.add_argument("--dataset", help="question list file (default backtest/data/questions.json)")
     parser.add_argument("--compare", help="batch to compare against the baseline batches")
+    parser.add_argument("--ensemble", help="compare: comma-separated batches; the compared forecast is the "
+                                           "median of their medians (each of its first --predictions)")
     parser.add_argument("--base-k", type=int, default=5, help="baseline predictions per question to use")
     parser.add_argument("--join-dates-within", type=int, default=0,
                         help="compare: resolution dates within this many days form one cluster")
@@ -458,6 +476,31 @@ def main() -> None:
         result["batches"] = args.batches
         OUT.mkdir(exist_ok=True)
         path = OUT / f"calibrate-{'+'.join(args.batches)}.json"
+        path.write_text(json.dumps(result, indent=1))
+        print(json.dumps(result, indent=1))
+        print(f"wrote {path}")
+        return
+    if args.ensemble:
+        if args.compare:
+            parser.error("use --compare or --ensemble, not both")
+        names = args.ensemble.split(",")
+        if args.base_k < len(names):
+            parser.error("--base-k must be at least the number of --ensemble batches")
+        batch_preds = [load([b])[2] for b in names]
+        other = ensemble(batch_preds, args.predictions)
+        if not other:
+            sys.exit(f"No question has {args.predictions} predictions in every --ensemble batch (check --predictions).")
+        dropped = len(set().union(*batch_preds)) - len(other)
+        result = compare(questions, preds, other, len(names), None, args.base_k, args.min_gain,
+                         args.join_dates_within)
+        if not result["questions"]:
+            sys.exit("No question has enough baseline predictions (check --base-k).")
+        result["join_dates_within"] = args.join_dates_within
+        result["ensemble_dropped_too_few_predictions"] = dropped
+        result["baseline"], result["compared"] = args.batches, f"median of {names}"
+        OUT.mkdir(exist_ok=True)
+        suffix = f"-join{args.join_dates_within}" if args.join_dates_within else ""
+        path = OUT / f"compare-{'+'.join(args.batches)}-vs-ensemble-{'+'.join(names)}{suffix}.json"
         path.write_text(json.dumps(result, indent=1))
         print(json.dumps(result, indent=1))
         print(f"wrote {path}")

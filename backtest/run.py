@@ -45,6 +45,14 @@ COMBO_IDS_SHA256 = "30a26a105ea5640472d0bd478c29176cc48ced47643cd66c65ee1bfeab23
 COMBO_SOURCES = ("research2", "wiki")  # stored AskNews and Wikipedia research
 ROUND2_PLAN = ROOT / "benchmarks" / "PLAN-refine-round2.md"
 ROUND2_AMEND = ROOT / "benchmarks" / "PLAN-refine-round2-amend1.md"
+ROUND3_PLAN = ROOT / "benchmarks" / "PLAN-refine-round3.md"
+# Forecasters the backtest may use, with their stated training cutoffs. Freezes start Aug 1, 2026.
+FORECASTERS = {
+    "claude-cli/claude-opus-5-5": "Opus 5.5 training cutoff stated as June 2026 (Claude Code model information)",
+    "claude-cli/claude-sonnet-5-5": "Sonnet 5.5 training cutoff June 2026 (Anthropic models overview, read Nov 25, 2026)",
+    "claude-cli/claude-fable-5-2": "Fable 5.2 training cutoff June 2026 (Anthropic models overview, read Nov 25, 2026)",
+}
+DEFAULT_EFFORT = "high"  # what the Claude Code settings file gave every batch before round 3
 FORECASTER = "claude-cli/claude-opus-5-5"
 HELPER = "claude-cli/claude-haiku-5-5"
 # Claude Code appends the real date to every system prompt and has no switch to
@@ -57,7 +65,6 @@ BACKTEST_SYSTEM_PROMPT = (
     "directly in plain text, following any output format it asks for."
 )
 SAMPLE_SEED = 20261125
-CUTOFF_SOURCE = "Opus 5.5 training cutoff stated as June 2026 (Claude Code model information)"
 
 _freeze_date: contextvars.ContextVar[datetime | None] = contextvars.ContextVar(
     "backtest_freeze_date", default=None
@@ -113,14 +120,19 @@ def to_question(q: dict):
     )
 
 
-def configure_env() -> None:
+def configure_env(effort: str = DEFAULT_EFFORT, prompt: str = "template") -> None:
     import claude_cli_llm
 
     claude_cli_llm.PLAIN_SYSTEM_PROMPT = BACKTEST_SYSTEM_PROMPT
+    # Effort is set for the forecaster only; helpers keep the settings file's level.
+    claude_cli_llm.PLAIN_EFFORT = {FORECASTER.removeprefix("claude-cli/"): effort}
+    if effort in ("xhigh", "max"):
+        claude_cli_llm.PLAIN_TIMEOUT = 25 * 60
     os.environ["FORECASTER_MODELS"] = FORECASTER
     os.environ["RESEARCHER_MODEL"] = "no_research"
     os.environ["SUMMARIZER_MODEL"] = HELPER
     os.environ["PARSER_MODEL"] = HELPER
+    os.environ["PROMPT_VERSION"] = prompt
     for name in ("REASONING_EFFORT", "FORECASTER_MAX_TOKENS", "PREDICTIONS_PER_QUESTION"):
         os.environ.pop(name, None)
 
@@ -140,6 +152,8 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         plan = ROUND2_PLAN
     if args.sample and args.research == "none" and not (args.dataset or args.freeze_on):  # first drift check
         plan = WIKI_PLAN
+    if round3(args):
+        plan = ROUND3_PLAN
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
     lines = {
         "command": " ".join(shlex.quote(a) for a in sys.argv),
@@ -157,7 +171,11 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         "dataset_commit": meta["dataset_commit"],
         "plan": plan.name,
         "plan_sha256": _sha256(plan) if plan.exists() else "missing",
-        "cutoff_source": CUTOFF_SOURCE,
+        "cutoff_source": FORECASTERS[FORECASTER],
+        "effort": f"{args.effort} (forecaster, claude --effort)",
+        "prompt_version": args.prompt,
+        "prompt_sha256": _sha256(ROOT / "prompts_v2.py") if args.prompt == "v2" else "template (main.py)",
+        "plain_timeout_s": __import__("claude_cli_llm").PLAIN_TIMEOUT,
         "freeze_from": meta["freeze_from"],
         "start": args.start,
         "limit": args.limit,
@@ -211,6 +229,26 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
     text = "".join(f"{k}: {v}\n" for k, v in lines.items())
     with open(batch_dir / "launch.txt", "a") as f:
         f.write(text + "\n")
+
+
+def round3(args: argparse.Namespace) -> bool:
+    return (args.effort != DEFAULT_EFFORT or args.prompt != "template"
+            or args.forecaster != "claude-cli/claude-opus-5-5")
+
+
+def check_resume_settings(first_launch: str, args: argparse.Namespace) -> str | None:
+    """The reason a resume would change this batch's forecaster, effort or prompt, or None.
+    Batches from before round 3 have no effort or prompt line: they ran at high with the template."""
+    lines = dict(ln.split(": ", 1) for ln in first_launch.splitlines() if ": " in ln)
+    if lines.get("forecaster", args.forecaster) != args.forecaster:
+        return "--forecaster differs from this batch's first launch."
+    if lines.get("effort", DEFAULT_EFFORT).split(" ")[0] != args.effort:
+        return "--effort differs from this batch's first launch."
+    if lines.get("prompt_version", "template") != args.prompt:
+        return "--prompt differs from this batch's first launch."
+    if args.prompt == "v2" and lines.get("prompt_sha256") != _sha256(ROOT / "prompts_v2.py"):
+        return "prompts_v2.py changed since this batch's first launch."
+    return None
 
 
 def done_counts(path: Path) -> dict[str, int]:
@@ -454,6 +492,11 @@ def main() -> None:
     parser.add_argument("--dataset", help="question list file (default backtest/data/questions.json)")
     parser.add_argument("--parallel", type=int, default=3, help="questions at a time")
     parser.add_argument("--probe-date", action="store_true")
+    parser.add_argument("--forecaster", default="claude-cli/claude-opus-5-5", choices=sorted(FORECASTERS))
+    parser.add_argument("--effort", default=DEFAULT_EFFORT, choices=["low", "medium", "high", "xhigh", "max"],
+                        help="the forecaster's Claude Code effort level")
+    parser.add_argument("--prompt", default="template", choices=["template", "v2"],
+                        help="binary prompt: the template's or prompts_v2.py")
     parser.add_argument("--research", default="none",
                         choices=["none", "asknews-historical", "wikipedia", "combined", "gdelt", "joined"])
     parser.add_argument("--sources", help="joined: batches whose stored research texts are joined, in order")
@@ -465,6 +508,8 @@ def main() -> None:
     parser.add_argument("--probe-research", action="store_true",
                         help="two AskNews calls for one question; prints the dates, saves nothing")
     args = parser.parse_args()
+    global FORECASTER
+    FORECASTER = args.forecaster
     if args.dataset:  # a held-out list instead of questions.json
         global QUESTIONS
         QUESTIONS = Path(args.dataset).resolve()
@@ -474,7 +519,7 @@ def main() -> None:
     refuse_in_ci()
     import ckai_bot  # noqa: F401  (loads .env, including RKIT_PATH)
 
-    configure_env()
+    configure_env(args.effort, args.prompt)
     block_metaculus()
     if args.probe_date:
         asyncio.run(probe_date())
@@ -521,6 +566,8 @@ def main() -> None:
         if f"questions_sha256: {meta['sha256']}" not in launch:
             sys.exit("The question list changed since this batch started; start a new batch.")
         first = launch.split("\n\n")[0]
+        if problem := check_resume_settings(first, args):
+            sys.exit(problem)
         for key, value in (("gdelt_lookback_days", args.lookback_days), ("joined_from", args.sources)):
             line = next((ln for ln in first.splitlines() if ln.startswith(key + ": ")), None)
             if line and key == "gdelt_lookback_days" and line != f"{key}: {value}":
