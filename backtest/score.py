@@ -26,6 +26,7 @@ paired by question.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import math
@@ -93,7 +94,7 @@ def load(batches: list[str]) -> tuple[dict, list[dict], dict[str, list[float]]]:
     return meta, [by_id[i] for i in preds], preds
 
 
-def clusters(questions: list[dict]) -> dict[str, str]:
+def clusters(questions: list[dict], join_days: int = 0) -> dict[str, str]:
     """Each question's resampling cluster: questions that share a Polymarket
     event group or a resolution date are joined (elections, Fed meetings and
     month-end questions resolve together). Coarse on purpose, so intervals err
@@ -110,6 +111,21 @@ def clusters(questions: list[dict]) -> dict[str, str]:
     for q in questions:
         parent[find("q:" + q["id"])] = find("g:" + q["group"])
         parent[find("g:" + q["group"])] = find("d:" + q.get("resolution_date", q["id"]))
+    if join_days:  # resolution dates within join_days of each other are one cluster
+        from datetime import date
+
+        by_day: dict[str, str] = {}  # day -> one full resolution_date string on it
+        for q in questions:
+            if q.get("resolution_date"):
+                day = q["resolution_date"][:10]
+                if day in by_day:
+                    parent[find("d:" + q["resolution_date"])] = find("d:" + by_day[day])
+                else:
+                    by_day[day] = q["resolution_date"]
+        days = sorted(by_day)
+        for a, b in zip(days, days[1:]):
+            if (date.fromisoformat(b) - date.fromisoformat(a)).days <= join_days:
+                parent[find("d:" + by_day[a])] = find("d:" + by_day[b])
     return {q["id"]: find("q:" + q["id"]) for q in questions}
 
 
@@ -248,6 +264,7 @@ def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: i
 def compare(
     questions: list[dict], base: dict[str, list[float]], other: dict[str, list[float]], k: int,
     research: dict[str, dict] | None = None, base_k: int = 5, min_gain: float | None = None,
+    join_days: int = 0,
 ) -> dict:
     """Paired gain of `other` (median of k) over `base` (expected median of k of
     its first base_k saved predictions). Positive gain: `other` scores better.
@@ -258,7 +275,7 @@ def compare(
     ids = [q["id"] for q in questions
            if len(other.get(q["id"], [])) >= k and len(base.get(q["id"], [])) >= base_k]
     full = [dict(q) for q in questions if q["id"] in ids]
-    cluster_of = clusters(full)
+    cluster_of = clusters(full, join_days)
     y = {q["id"]: q["outcome"] for q in full}
     crowd = {q["id"]: q["crowd"] for q in full}
     med = {i: statistics.median(other[i][:k]) for i in ids}
@@ -327,16 +344,124 @@ def compare(
     return result
 
 
+CAL_ALPHAS = [round(0.2 + 0.05 * i, 2) for i in range(57)]  # 0.2 to 3.0
+CAL_BETAS = [round(-1.0 + 0.05 * i, 2) for i in range(41)]  # -1.0 to 1.0
+CAL_SEEDS = 20
+CAL_PLAN = HERE.parent / "benchmarks" / "PLAN-refine-round2.md"
+
+
+def _fit_calibration(lp, y, with_beta: bool) -> tuple[float, float]:
+    """Grid fit of sigmoid(alpha * logit(p) + beta) by mean Brier (numpy arrays in)."""
+    import numpy as np
+
+    alphas = np.array(CAL_ALPHAS)[:, None, None]
+    betas = (np.array(CAL_BETAS) if with_beta else np.zeros(1))[None, :, None]
+    p = 1 / (1 + np.exp(-(alphas * lp[None, None, :] + betas)))
+    p = np.clip(p, *CLIP)
+    loss = ((p - y[None, None, :]) ** 2).mean(axis=2)
+    a, b = np.unravel_index(np.argmin(loss), loss.shape)
+    return float(CAL_ALPHAS[a]), (float(CAL_BETAS[b]) if with_beta else 0.0)
+
+
+def _apply_calibration(p: float, alpha: float, beta: float) -> float:
+    return min(max(1 / (1 + math.exp(-(alpha * logit(p) + beta))), CLIP[0]), CLIP[1])
+
+
+def calibrate(questions: list[dict], preds: dict[str, list[float]], k: int) -> dict:
+    """PLAN-refine-round2.md, section 2: variants A (alpha) and B (alpha, beta)
+    against no adjustment, out of fold by cluster, repeated over CAL_SEEDS fold
+    seeds; Holm over the two; then the adoption rule."""
+    import numpy as np
+
+    full = [dict(q) for q in questions if len(preds.get(q["id"], [])) >= k]
+    cluster_of = clusters(full)
+    ids = [q["id"] for q in full]
+    y = {q["id"]: q["outcome"] for q in full}
+    med = {i: min(max(statistics.median(preds[i][:k]), CLIP[0]), CLIP[1]) for i in ids}
+    base = {i: brier(med[i], y[i]) for i in ids}
+    groups = sorted(set(cluster_of.values()))
+    variants = {"A_alpha": False, "B_alpha_beta": True}
+    per_seed = {v: [] for v in variants}  # mean out-of-fold gain per seed
+    first_seed_diffs = {}
+    for seed in range(CAL_SEEDS):
+        order = list(groups)
+        random.Random(SEED + seed).shuffle(order)
+        fold_of = {g: n % FOLDS for n, g in enumerate(order)}
+        for name, with_beta in variants.items():
+            diffs = {}
+            for f in range(FOLDS):
+                train = [i for i in ids if fold_of[cluster_of[i]] != f]
+                test = [i for i in ids if fold_of[cluster_of[i]] == f]
+                if not train or not test:
+                    continue
+                a, b = _fit_calibration(np.array([logit(med[i]) for i in train]),
+                                        np.array([y[i] for i in train], dtype=float), with_beta)
+                for i in test:
+                    diffs[i] = base[i] - brier(_apply_calibration(med[i], a, b), y[i])
+            per_seed[name].append(statistics.fmean(diffs.values()))
+            if seed == 0:
+                first_seed_diffs[name] = diffs
+    result = {"plan": CAL_PLAN.name,
+              "plan_sha256": hashlib.sha256(CAL_PLAN.read_bytes()).hexdigest() if CAL_PLAN.exists() else "missing",
+              "questions": len(ids), "clusters": len(groups), "predictions": k,
+              "brier_uncalibrated": statistics.fmean(base.values()),
+              "mean_forecast": statistics.fmean(med.values()), "yes_rate": statistics.fmean(y.values()),
+              "variants": {}}
+    pvalues = {}
+    for name in variants:
+        m, lo, hi, p = group_bootstrap(first_seed_diffs[name], cluster_of)
+        seeds = per_seed[name]
+        result["variants"][name] = {
+            "gain_mean_over_seeds": statistics.fmean(seeds),
+            "gain_seed_spread": [min(seeds), max(seeds)],
+            "gain_first_seed": m, "ci95_first_seed": [lo, hi], "p_first_seed": p,
+        }
+        pvalues[name] = p
+    for name, p in holm(pvalues).items():
+        result["variants"][name]["p_holm"] = p
+    a, b = result["variants"]["A_alpha"], result["variants"]["B_alpha_beta"]
+    a_pass = a["gain_mean_over_seeds"] >= 0.005 and a["p_holm"] < 0.05
+    b_pass = b["gain_mean_over_seeds"] >= 0.005 and b["p_holm"] < 0.05
+    b_better = b["gain_mean_over_seeds"] - a["gain_mean_over_seeds"] >= 0.003
+    adopted = "B_alpha_beta" if (b_pass and b_better) else ("A_alpha" if a_pass else None)
+    lp = np.array([logit(med[i]) for i in ids])
+    yy = np.array([y[i] for i in ids], dtype=float)
+    fits = {name: _fit_calibration(lp, yy, wb) for name, wb in variants.items()}
+    result["rule"] = ("A if gain >= 0.005 and Holm p < 0.05; B instead if B passes the same and beats A by >= 0.003; "
+                      "adoption waits for the held-out harm check")
+    result["passes"] = {"A_alpha": a_pass, "B_alpha_beta": b_pass, "B_beats_A_by_0.003": b_better}
+    result["adopted_pending_heldout"] = adopted
+    result["fitted_on_all"] = {name: {"alpha": f[0], "beta": f[1]} for name, f in fits.items()}
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("batches", nargs="+")
     parser.add_argument("--predictions", type=int, default=5)
+    parser.add_argument("--dataset", help="question list file (default backtest/data/questions.json)")
     parser.add_argument("--compare", help="batch to compare against the baseline batches")
     parser.add_argument("--base-k", type=int, default=5, help="baseline predictions per question to use")
+    parser.add_argument("--join-dates-within", type=int, default=0,
+                        help="compare: resolution dates within this many days form one cluster")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="the calibration test of PLAN-refine-round2.md on the given batch")
     parser.add_argument("--min-gain", type=float, default=None,
                         help="pass rule: gain at least this, no interval condition (default: the research rule)")
     args = parser.parse_args()
+    if args.dataset:  # a held-out list instead of questions.json
+        global QUESTIONS
+        QUESTIONS = Path(args.dataset).resolve()
     meta, questions, preds = load(args.batches)
+    if args.calibrate:
+        result = calibrate(questions, preds, args.predictions)
+        result["batches"] = args.batches
+        OUT.mkdir(exist_ok=True)
+        path = OUT / f"calibrate-{'+'.join(args.batches)}.json"
+        path.write_text(json.dumps(result, indent=1))
+        print(json.dumps(result, indent=1))
+        print(f"wrote {path}")
+        return
     if args.compare:
         _, _, other = load([args.compare])
         rpath = RUNS / args.compare / "research.jsonl"
@@ -348,10 +473,13 @@ def main() -> None:
                 except json.JSONDecodeError:  # a line cut short by a hard kill
                     continue
                 research[row["id"]] = row
-        result = compare(questions, preds, other, args.predictions, research, args.base_k, args.min_gain)
+        result = compare(questions, preds, other, args.predictions, research, args.base_k, args.min_gain,
+                         args.join_dates_within)
+        result["join_dates_within"] = args.join_dates_within
         result["baseline"], result["compared"] = args.batches, args.compare
         OUT.mkdir(exist_ok=True)
-        path = OUT / f"compare-{'+'.join(args.batches)}-vs-{args.compare}.json"
+        suffix = f"-join{args.join_dates_within}" if args.join_dates_within else ""
+        path = OUT / f"compare-{'+'.join(args.batches)}-vs-{args.compare}{suffix}.json"
         path.write_text(json.dumps(result, indent=1))
         print(json.dumps(result, indent=1))
         print(f"wrote {path}")

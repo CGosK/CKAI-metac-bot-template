@@ -11,6 +11,12 @@ ForecastBench datasets: https://github.com/forecastingresearch/forecastbench-dat
 
 Usage:
     uv run python -m backtest.fetch [--commit SHA] [--freeze-from 2026-08-01]
+    uv run python -m backtest.fetch --exclude-list backtest/data/questions.json   # held-out list
+
+With --exclude-list, the output is a held-out list (PLAN-refine-round2.md):
+questions not in the given list and sharing no event with it (same group, or a
+resolution date within a day of one of its questions), written to
+backtest/data/heldout-<commit>.json.
 """
 
 from __future__ import annotations
@@ -128,6 +134,30 @@ def select(
     return questions, dropped
 
 
+def exclude_overlap(questions: list[dict], existing: list[dict], days: int = 1) -> tuple[list[dict], dict[str, int]]:
+    """Drop questions in `existing` by id, by group, or by a resolution date
+    within `days` of one of its questions, so no event is in both lists."""
+    from datetime import date, timedelta
+
+    ids = {q["id"] for q in existing}
+    groups = {q["group"] for q in existing}
+    near: set[str] = set()
+    for q in existing:
+        d = date.fromisoformat(q["resolution_date"][:10])
+        near.update((d + timedelta(days=k)).isoformat() for k in range(-days, days + 1))
+    kept, dropped = [], {"same_id": 0, "same_group": 0, "resolution_date_within_%d_day" % days: 0}
+    for q in questions:
+        if q["id"] in ids:
+            dropped["same_id"] += 1
+        elif q["group"] in groups:
+            dropped["same_group"] += 1
+        elif q["resolution_date"][:10] in near:
+            dropped["resolution_date_within_%d_day" % days] += 1
+        else:
+            kept.append(q)
+    return kept, dropped
+
+
 def list_hash(questions: list[dict]) -> str:
     return hashlib.sha256(json.dumps(questions, sort_keys=True).encode()).hexdigest()
 
@@ -136,6 +166,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--commit", help="dataset commit SHA (default: current main)")
     parser.add_argument("--freeze-from", default=DEFAULT_FREEZE_FROM)
+    parser.add_argument("--exclude-list", help="build a held-out list: leave out this list's questions and events")
     args = parser.parse_args()
 
     commit = args.commit or _get_json(f"https://api.github.com/repos/{REPO}/commits/main")["sha"]
@@ -159,6 +190,13 @@ def main() -> None:
         sets.append((date, q, r))
 
     questions, dropped = select(sets, args.freeze_from)
+    excluded_from = None
+    if args.exclude_list:
+        existing = json.loads(Path(args.exclude_list).read_text())
+        questions, overlap = exclude_overlap(questions, existing["questions"])
+        dropped = {**dropped, **{f"overlap_{k}": v for k, v in overlap.items()}}
+        excluded_from = {"file": Path(args.exclude_list).name, "sha256": existing["sha256"],
+                         "dataset_commit": existing["dataset_commit"]}
     DATA_DIR.mkdir(exist_ok=True)
     out = {
         "dataset": f"https://github.com/{REPO}",
@@ -168,15 +206,22 @@ def main() -> None:
         "sets": [d for d, _, _ in sets],
         "dropped": dropped,
         "sha256": list_hash(questions),
+        **({"excluded_from": excluded_from} if excluded_from else {}),
         "questions": questions,
     }
-    path = DATA_DIR / "questions.json"
+    path = DATA_DIR / (f"heldout-{commit[:12]}.json" if excluded_from else "questions.json")
+    if excluded_from and path.exists():
+        sys.exit(f"{path} exists; held-out lists are never overwritten.")
     path.write_text(json.dumps(out, indent=1))
     by_source: dict[str, int] = {}
     for q in questions:
         by_source[q["source"]] = by_source.get(q["source"], 0) + 1
     groups = len({q["group"] for q in questions})
+    by_freeze: dict[str, int] = {}
+    for q in questions:
+        by_freeze[q["freeze_datetime"][:10]] = by_freeze.get(q["freeze_datetime"][:10], 0) + 1
     print(f"{len(questions)} questions in {groups} groups {by_source}; dropped {dropped}")
+    print(f"by freeze date: {dict(sorted(by_freeze.items()))}")
     print(f"dataset commit {commit}; list sha256 {out['sha256']}; wrote {path}")
 
 

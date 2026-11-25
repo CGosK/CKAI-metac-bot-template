@@ -43,6 +43,8 @@ LIVE_WIKI_PLAN = ROOT / "benchmarks" / "PLAN-live-wikipedia.md"
 COMBO_IDS = ROOT / "benchmarks" / "combo-ids.json"
 COMBO_IDS_SHA256 = "30a26a105ea5640472d0bd478c29176cc48ced47643cd66c65ee1bfeab239b25"
 COMBO_SOURCES = ("research2", "wiki")  # stored AskNews and Wikipedia research
+ROUND2_PLAN = ROOT / "benchmarks" / "PLAN-refine-round2.md"
+ROUND2_AMEND = ROOT / "benchmarks" / "PLAN-refine-round2-amend1.md"
 FORECASTER = "claude-cli/claude-opus-5-5"
 HELPER = "claude-cli/claude-haiku-5-5"
 # Claude Code appends the real date to every system prompt and has no switch to
@@ -133,8 +135,10 @@ def _git(*args: str) -> str:
 
 def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
     plan = {"asknews-historical": RESEARCH_PLAN, "wikipedia": WIKI_PLAN,
-            "combined": LIVE_WIKI_PLAN}.get(args.research, PLAN)
-    if args.sample:  # the drift check belongs to the Wikipedia plan
+            "combined": LIVE_WIKI_PLAN, "gdelt": ROUND2_PLAN, "joined": ROUND2_PLAN}.get(args.research, PLAN)
+    if args.dataset or args.freeze_on:
+        plan = ROUND2_PLAN
+    if args.sample and args.research == "none" and not (args.dataset or args.freeze_on):  # first drift check
         plan = WIKI_PLAN
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
     lines = {
@@ -148,6 +152,7 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         "git_head": _git("rev-parse", "HEAD"),
         "git_dirty": bool(_git("status", "--porcelain")),
         "utc_start": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "dataset": QUESTIONS.name,
         "questions_sha256": meta["sha256"],
         "dataset_commit": meta["dataset_commit"],
         "plan": plan.name,
@@ -172,6 +177,24 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         lines["user_agent"] = wiki.USER_AGENT
         lines["mwparserfromhell_version"] = pkg_version("mwparserfromhell")
         lines["wiki_py_sha256"] = _sha256(Path(wiki.__file__))
+    if args.freeze_on:
+        lines["freeze_on"] = args.freeze_on
+    if args.research == "gdelt":
+        import gdelt_research
+
+        lines["plan_amendment"] = ROUND2_AMEND.name
+        lines["plan_amendment_sha256"] = _sha256(ROUND2_AMEND) if ROUND2_AMEND.exists() else "missing"
+        lines["gdelt_lookback_days"] = args.lookback_days
+        lines["gdelt_settings"] = (f"queries<={gdelt_research.MAX_QUERIES} sub_windows={gdelt_research.SUB_WINDOWS} "
+                                   f"per_window={gdelt_research.PER_WINDOW} kept<={gdelt_research.MAX_HEADLINES} "
+                                   f"gap={gdelt_research.GAP_SECONDS}s")
+        lines["gdelt_helper"] = HELPER + " (plain mode, no tools)"
+        lines["user_agent"] = gdelt_research.USER_AGENT
+        lines["gdelt_research_py_sha256"] = _sha256(Path(gdelt_research.__file__))
+    if args.research == "joined":
+        lines["joined_from"] = ", ".join(
+            f"runs/{b}/research.jsonl (sha256 {_sha256(RUNS / b / 'research.jsonl')})" for b in args.sources.split(","))
+        lines["joined_with"] = "wiki_research.join_research, texts that found nothing left out"
     if args.research == "combined":
         lines["combined_from"] = ", ".join(f"runs/{b}/research.jsonl" for b in COMBO_SOURCES)
         lines["combined_join"] = "wiki_research.join_research (the live bot's join)"
@@ -226,6 +249,23 @@ def combined_row(qid: str, news: dict, wiki_rows: dict) -> dict:
             "sources": list(COMBO_SOURCES)}
 
 
+def joined_row(qid: str, stores: list[dict]) -> dict:
+    """Stored research texts for one question, joined in order with the live
+    bot's join; a text that found nothing is left out."""
+    from wiki_research import NO_ARTICLES, join_research
+
+    texts = []
+    for rows in stores:
+        if qid not in rows:
+            raise ValueError(f"{qid}: a stored text is missing for the joined arm")
+        if rows[qid]["text"].strip() != NO_ARTICLES:
+            texts.append(rows[qid]["text"])
+    text = ""
+    for t in texts:
+        text = join_research(text, t)
+    return {"text": text or NO_ARTICLES}
+
+
 def combo_ids() -> list[str]:
     """The pre-registered ids; the hash is of the ids joined by newlines."""
     ids = json.loads(COMBO_IDS.read_text())
@@ -256,12 +296,17 @@ async def forecast_one(bot, q: dict, k: int, research: str = "") -> dict:
 
 
 async def run_batch(
-    questions: list[dict], batch_dir: Path, predictions: int, parallel: int, research_mode: str = "none"
+    questions: list[dict], batch_dir: Path, predictions: int, parallel: int, research_mode: str = "none",
+    sources: list[str] | None = None, lookback_days: int | None = None,
 ) -> None:
+    """predictions=0 with a research mode fetches and stores research only."""
     import ckai_bot
     from backtest.research import ResearchStopped
     from backtest.wiki import WikiLeak, WikiStopped
     from claude_cli_llm import ClaudeCliRefused
+    from gdelt_research import GdeltStopped
+
+    stops = (MetaculusBlocked, ClaudeCliRefused, ResearchStopped, WikiLeak, WikiStopped, GdeltStopped)
 
     bot = ckai_bot.build_bot(publish=False, forecaster_models=[FORECASTER])
     out = batch_dir / "predictions.jsonl"
@@ -292,16 +337,36 @@ async def run_batch(
             return combined_row(q["id"], news, wiki_rows)
 
         store = ResearchStore(batch_dir / "research.jsonl", fetcher=combined_fetch, serial=False)
+    elif research_mode == "gdelt":
+        import gdelt_research
+        from backtest.research import ResearchStore
+        from claude_cli_llm import PLAIN, ClaudeCliLlm
+
+        helper = ClaudeCliLlm(HELPER, mode=PLAIN, allowed_tries=2)
+
+        async def gdelt_fetch(q: dict) -> dict:
+            return await gdelt_research.research_for(q, helper, lookback_days)
+
+        store = ResearchStore(batch_dir / "research.jsonl", fetcher=gdelt_fetch, serial=False)
+    elif research_mode == "joined":
+        from backtest.research import ResearchStore
+
+        stored = [stored_research(b) for b in sources]
+
+        async def joined_fetch(q: dict) -> dict:
+            return joined_row(q["id"], stored)
+
+        store = ResearchStore(batch_dir / "research.jsonl", fetcher=joined_fetch, serial=False)
     slots = asyncio.Semaphore(parallel)
 
     async def do_question(q: dict) -> None:
         async with slots:
-            if done.get(q["id"], 0) >= predictions:
+            if predictions and done.get(q["id"], 0) >= predictions:
                 print(f"done {q['id']}", flush=True)
                 return
             try:
                 research = await store.get(q) if store else ""
-            except (MetaculusBlocked, ClaudeCliRefused, ResearchStopped, WikiLeak, WikiStopped):
+            except stops:
                 raise
             except Exception as exc:  # this question's research failed: record it, go on, retry on resume
                 async with lock:
@@ -313,7 +378,7 @@ async def run_batch(
             for k in range(done.get(q["id"], 0), predictions):
                 try:
                     row = await forecast_one(bot, q, k, research)
-                except (MetaculusBlocked, ClaudeCliRefused, ResearchStopped, WikiLeak, WikiStopped):
+                except stops:
                     raise
                 except Exception as exc:  # a failed call or parse: record it and go on
                     row = {
@@ -386,16 +451,23 @@ def main() -> None:
     parser.add_argument("--start", type=int, default=0, help="first question index in the list")
     parser.add_argument("--limit", type=int, default=None, help="number of questions")
     parser.add_argument("--predictions", type=int, default=5)
+    parser.add_argument("--dataset", help="question list file (default backtest/data/questions.json)")
     parser.add_argument("--parallel", type=int, default=3, help="questions at a time")
     parser.add_argument("--probe-date", action="store_true")
-    parser.add_argument("--research", choices=["none", "asknews-historical", "wikipedia", "combined"],
-                        default="none")
+    parser.add_argument("--research", default="none",
+                        choices=["none", "asknews-historical", "wikipedia", "combined", "gdelt", "joined"])
+    parser.add_argument("--sources", help="joined: batches whose stored research texts are joined, in order")
+    parser.add_argument("--lookback-days", type=int, help="gdelt: look-back before the freeze, in days")
+    parser.add_argument("--freeze-on", help="only questions frozen on these dates (comma-separated YYYY-MM-DD)")
     parser.add_argument("--sample", type=int, default=None, help="a seeded random sample of this many questions")
     parser.add_argument("--probe-wiki", type=int, default=None, metavar="N",
                         help="Wikipedia research only, for the first N questions; prints it, saves nothing")
     parser.add_argument("--probe-research", action="store_true",
                         help="two AskNews calls for one question; prints the dates, saves nothing")
     args = parser.parse_args()
+    if args.dataset:  # a held-out list instead of questions.json
+        global QUESTIONS
+        QUESTIONS = Path(args.dataset).resolve()
 
     from claude_cli_llm import refuse_in_ci
 
@@ -420,6 +492,13 @@ def main() -> None:
     questions = meta["questions"]
     end = None if args.limit is None else args.start + args.limit
     chosen = questions[args.start : end]
+    if args.freeze_on:
+        days = set(args.freeze_on.split(","))
+        chosen = [q for q in chosen if q["freeze_datetime"][:10] in days]
+    if args.research == "joined" and not args.sources:
+        parser.error("--research joined needs --sources")
+    if args.research == "gdelt" and not args.lookback_days:
+        parser.error("--research gdelt needs --lookback-days")
     if args.sample:
         import random
 
@@ -441,6 +520,14 @@ def main() -> None:
         launch = (batch_dir / "launch.txt").read_text()
         if f"questions_sha256: {meta['sha256']}" not in launch:
             sys.exit("The question list changed since this batch started; start a new batch.")
+        first = launch.split("\n\n")[0]
+        for key, value in (("gdelt_lookback_days", args.lookback_days), ("joined_from", args.sources)):
+            line = next((ln for ln in first.splitlines() if ln.startswith(key + ": ")), None)
+            if line and key == "gdelt_lookback_days" and line != f"{key}: {value}":
+                sys.exit("--lookback-days differs from this batch's first launch.")
+            if line and key == "joined_from" and [x.split("/")[1] for x in line[len(key) + 2:].split(", ")] != (
+                    (value or "").split(",")):
+                sys.exit("--sources differs from this batch's first launch.")
     ids_path = batch_dir / "question_ids.json"
     if ids_path.exists() and json.loads(ids_path.read_text()) != [q["id"] for q in chosen]:
         sys.exit("--start/--limit/--sample differ from this batch's first launch.")
@@ -449,7 +536,8 @@ def main() -> None:
 
     install_date_stub()
     try:
-        asyncio.run(run_batch(chosen, batch_dir, args.predictions, args.parallel, args.research))
+        asyncio.run(run_batch(chosen, batch_dir, args.predictions, args.parallel, args.research,
+                              args.sources.split(",") if args.sources else None, args.lookback_days))
     finally:
         from claude_cli_llm import get_backend
 

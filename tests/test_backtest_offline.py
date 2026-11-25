@@ -537,3 +537,56 @@ def test_wiki_helper_runs_without_tools():
     assert "ClaudeCliLlm(HELPER, mode=PLAIN" in src
     assert "RESEARCH" not in src.split("wiki_fetch")[0].split("wikipedia")[-1]
     assert claude_cli_llm.PLAIN != claude_cli_llm.RESEARCH
+
+
+# Calibration test (PLAN-refine-round2.md, section 2)
+
+
+def _synthetic(n, alpha, beta, seed=3):
+    import math
+    import random as rnd
+
+    r = rnd.Random(seed)
+    qs, preds = [], {}
+    for i in range(n):
+        q = r.uniform(0.03, 0.97)  # true probability
+        y = int(r.random() < q)
+        # The forecaster's p is miscalibrated so that sigmoid(alpha*logit(p)+beta) = q.
+        p = 1 / (1 + math.exp(-((math.log(q / (1 - q)) - beta) / alpha)))
+        qid = f"c{i}"
+        qs.append({"id": qid, "group": f"g{i}", "resolution_date": f"d{i % 40}", "outcome": y, "crowd": 0.5})
+        preds[qid] = [p] * 3
+    return qs, preds
+
+
+def test_calibration_recovers_known_parameters(monkeypatch):
+    monkeypatch.setattr(score, "CAL_SEEDS", 2)
+    qs, preds = _synthetic(3000, alpha=1.6, beta=0.4)
+    result = score.calibrate(qs, preds, 3)
+    fit = result["fitted_on_all"]["B_alpha_beta"]
+    assert fit["alpha"] == pytest.approx(1.6, abs=0.25) and fit["beta"] == pytest.approx(0.4, abs=0.15)
+    assert result["variants"]["B_alpha_beta"]["gain_mean_over_seeds"] > 0
+    assert result["clusters"] == 40
+
+
+def test_calibration_finds_nothing_on_calibrated_forecasts(monkeypatch):
+    monkeypatch.setattr(score, "CAL_SEEDS", 2)
+    qs, preds = _synthetic(3000, alpha=1.0, beta=0.0)
+    result = score.calibrate(qs, preds, 3)
+    assert result["adopted_pending_heldout"] is None
+    assert abs(result["variants"]["A_alpha"]["gain_mean_over_seeds"]) < 0.003
+
+
+def test_heldout_excludes_ids_groups_and_nearby_dates():
+    def q(i, group, date):
+        return {"id": i, "group": group, "resolution_date": date}
+
+    existing = [q("a", "g1", "2026-11-04"), q("b", "g2", "2026-10-01")]
+    new = [q("a", "gx", "2026-12-20"),        # same id
+           q("c", "g1", "2026-12-20"),        # same group
+           q("d", "g9", "2026-11-03"),        # a day before an existing resolution date
+           q("e", "g9", "2026-11-06"),        # two days after: kept
+           q("f", "g8", "2026-12-20")]        # unrelated: kept
+    kept, dropped = fetch.exclude_overlap(new, existing)
+    assert [x["id"] for x in kept] == ["e", "f"]
+    assert dropped == {"same_id": 1, "same_group": 1, "resolution_date_within_1_day": 1}
