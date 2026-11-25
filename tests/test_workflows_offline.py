@@ -27,6 +27,8 @@ REQUIRED = {
     "PREDICTIONS_PER_QUESTION": "vars",
     "REASONING_EFFORT": "vars",
     "FORECASTER_MAX_TOKENS": "vars",
+    "WIKI_RESEARCH": "vars",
+    "WIKI_HELPER_MODEL": "vars",
 }
 
 

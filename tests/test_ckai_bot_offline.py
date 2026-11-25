@@ -35,6 +35,8 @@ def offline_env(monkeypatch):
     monkeypatch.setenv("PARSER_MODEL", "openrouter/test/parser")
     monkeypatch.setenv("OPENROUTER_API_KEY", "offline-test-not-a-real-key")
     monkeypatch.delenv("REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("WIKI_RESEARCH", raising=False)
+    monkeypatch.delenv("WIKI_HELPER_MODEL", raising=False)
     yield
 
 

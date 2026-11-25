@@ -18,6 +18,15 @@ What it adds to the template:
   FORECASTER_MAX_TOKENS caps their output (thinking plus answer); it defaults
   to 32000 at low, medium and high effort.
   Anything left unset falls back to the template's defaults.
+- Research errors don't cost the forecast: if the researcher (AskNews) raises,
+  the bot logs a warning and forecasts with no research instead of dropping
+  the question.
+- Wikipedia research (wiki_research.py), set by WIKI_RESEARCH:
+  off (default), fallback (when AskNews fails, finds nothing, or
+  RESEARCHER_MODEL=no_research) or append (after AskNews, every question).
+  WIKI_HELPER_MODEL picks the article titles and sections; it defaults to
+  Haiku 5.5 on OpenRouter, the model the backtest used. Backtested on binary
+  questions only.
 - Dry run: `--dry-run` (or DRY_RUN=true) forecasts without publishing anything
   to Metaculus and saves the reports to ./forecast_reports for review.
 - `--max-questions N` (test_questions mode): forecast only N bot-testing-area
@@ -48,8 +57,10 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from fractions import Fraction
 from typing import Literal
 
@@ -77,11 +88,13 @@ from claude_cli_llm import (  # noqa: E402
     PLAIN,
     RESEARCH,
     ClaudeCliLlm,
+    ClaudeCliCallFailed,
     ClaudeCliRefused,
     is_claude_cli,
     kill_running_calls,
     refuse_in_ci,
 )
+import wiki_research  # noqa: E402
 from main import FallTemplateBot2026  # noqa: E402
 
 dotenv.load_dotenv()
@@ -261,7 +274,21 @@ def make_forecaster(model: str) -> GeneralLlm:
     )
 
 
-MODEL_SETTINGS = ("FORECASTER_MODELS", "RESEARCHER_MODEL", "SUMMARIZER_MODEL", "PARSER_MODEL")
+MODEL_SETTINGS = ("FORECASTER_MODELS", "RESEARCHER_MODEL", "SUMMARIZER_MODEL", "PARSER_MODEL",
+                  "WIKI_HELPER_MODEL")
+
+WIKI_MODES = ("off", "fallback", "append")
+DEFAULT_WIKI_HELPER = "openrouter/anthropic/claude-haiku-5.5"
+WIKI_DEADLINE = 600  # seconds for one question's Wikipedia research
+NO_NEWS = "No articles were found."  # AskNewsSearcher's text when it finds nothing
+
+
+def wiki_research_mode() -> str:
+    """WIKI_RESEARCH: off (default), fallback or append. Raises ValueError otherwise."""
+    value = (_env("WIKI_RESEARCH") or "off").lower()
+    if value not in WIKI_MODES:
+        raise ValueError(f"WIKI_RESEARCH={value!r}: use one of {', '.join(WIKI_MODES)}")
+    return value
 
 
 # Research settings allowed alongside claude-cli models: none, or AskNews news
@@ -323,6 +350,10 @@ def check_claude_cli_config(run_mode: str, publish: bool) -> None:
     for var in ("SUMMARIZER_MODEL", "PARSER_MODEL"):
         if not is_claude_cli(_env(var)):
             problems.append(var)
+    if (wiki_research_mode() != "off" or _env("WIKI_HELPER_MODEL")) and not is_claude_cli(
+        _env("WIKI_HELPER_MODEL")
+    ):
+        problems.append("WIKI_HELPER_MODEL")
     if problems:
         raise ClaudeCliRefused(
             "With claude-cli models, every LLM setting must be a claude-cli model (research may "
@@ -362,6 +393,79 @@ def llms_from_env() -> dict[str, str | GeneralLlm]:
     return llms
 
 
+class LiveWiki:
+    """Wikipedia research for one bot run.
+
+    One time point per run (the first fetch), so every question shares the
+    Current events portal pages, fetched once, lazily. Questions take turns
+    (Wikipedia requests go one at a time anyway), and each question's deadline
+    starts when its turn does, so a long queue isn't mistaken for a failure.
+    A Wikipedia failure switches it off for the rest of the run (the circuit
+    breaker) and closes the API, so requests queued behind it fail at once; a
+    question that only runs past its deadline is skipped on its own."""
+
+    def __init__(self, helper: GeneralLlm, api: wiki_research.Api | None = None):
+        self.helper = helper
+        self.api = api or wiki_research.live_api()
+        self.freeze: datetime | None = None
+        self.off = False
+        self._lock = threading.Lock()
+        # One per event loop: tournament mode runs two asyncio.run calls.
+        self._turns: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+
+    def _turn(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if loop not in self._turns:
+                self._turns[loop] = asyncio.Semaphore(1)
+            return self._turns[loop]
+
+    def trip(self, reason: str) -> None:
+        if not self.off:
+            logger.warning(f"Wikipedia research off for the rest of this run: {reason}")
+        self.off = True
+        self.api.close()
+
+    async def research(self, question: MetaculusQuestion) -> str:
+        """The Wikipedia text for a question, or "" if there is none or it failed."""
+        async with self._turn():
+            return await self._research(question)
+
+    async def _research(self, question: MetaculusQuestion) -> str:
+        if self.off:
+            return ""
+        with self._lock:
+            if self.freeze is None:
+                self.freeze = datetime.now(timezone.utc).replace(microsecond=0)
+        q = {
+            "question": question.question_text,
+            "criteria": question.resolution_criteria or "",
+            "freeze_datetime": self.freeze.isoformat(),
+        }
+        try:
+            row = await asyncio.wait_for(
+                wiki_research.research_for(q, self.helper, self.api, include_today=True),
+                WIKI_DEADLINE,
+            )
+        except ClaudeCliRefused:
+            raise
+        except (wiki_research.WikiStopped, wiki_research.WikiLeak) as exc:
+            self.trip(f"{exc.__class__.__name__}: {exc}")
+            return ""
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(f"Wikipedia research for {question.page_url} ran past {WIKI_DEADLINE} s; skipped")
+            return ""
+        except Exception as exc:  # e.g. a helper reply without JSON: this question only
+            logger.warning(f"Wikipedia research failed for {question.page_url}: {exc.__class__.__name__}: {exc}")
+            return ""
+        logger.info(
+            f"Wikipedia research for {question.page_url}: "
+            + ", ".join(f"{a['title']} (rev {a['revid']})" for a in row["articles"])
+            + f"; {row['portal_items']} portal items"
+        )
+        return "" if row["text"] == wiki_research.NO_ARTICLES else row["text"]
+
+
 class CkaiBot(FallTemplateBot2026):
     """The template bot with a round-robin model ensemble for forecasting."""
 
@@ -371,8 +475,17 @@ class CkaiBot(FallTemplateBot2026):
             make_forecaster(m) for m in (forecaster_models or [])
         ]
         self._next_forecaster = 0
+        self._wiki_mode = wiki_research_mode()
+        self._wiki: LiveWiki | None = None
+        self._wiki_parts: dict[str, str] = {}
+        if self._wiki_mode != "off":
+            helper = make_llm(
+                _env("WIKI_HELPER_MODEL") or DEFAULT_WIKI_HELPER, temperature=0, purpose="wiki_helper"
+            )
+            self._wiki = LiveWiki(helper)
         self._claude_cli = any(
-            is_claude_cli(llm) for llm in [*self._llms.values(), *self._forecasters]
+            is_claude_cli(llm)
+            for llm in [*self._llms.values(), *self._forecasters, *([self._wiki.helper] if self._wiki else [])]
         )
         if self._claude_cli:
             self._check_claude_cli_bot()
@@ -399,6 +512,8 @@ class CkaiBot(FallTemplateBot2026):
             )
         ]
         not_cli += [llm.model for llm in self._forecasters if not isinstance(llm, ClaudeCliLlm)]
+        if self._wiki and not isinstance(self._wiki.helper, ClaudeCliLlm):
+            not_cli.append("WIKI_HELPER_MODEL")
         if not_cli:
             raise ClaudeCliRefused(
                 "With claude-cli models, every model must be one. Not claude-cli: "
@@ -418,6 +533,48 @@ class CkaiBot(FallTemplateBot2026):
                     "nowhere else. Not allowed: " + ", ".join(str(u) for u in outside[:5])
                 )
         return await super().forecast_questions(questions, *args, **kwargs)
+
+    async def run_research(self, question: MetaculusQuestion) -> str:
+        """The template's research, which no longer fails the question when it
+        raises, plus Wikipedia per WIKI_RESEARCH."""
+        failed = False
+        try:
+            research = await super().run_research(question)
+        except (ClaudeCliRefused, ClaudeCliCallFailed):
+            raise  # claude-cli runs are local dry runs: a failed call should show, not pass as no research
+        except Exception as exc:  # e.g. AskNews out of credit: forecast without research
+            logger.warning(
+                f"Research failed for {question.page_url}; forecasting without it. "
+                f"{exc.__class__.__name__}: {str(exc)[:300]}"
+            )
+            research, failed = "", True
+        if self._wiki is None:
+            return research
+        if self._wiki_mode == "fallback" and not (
+            failed
+            or not research.strip()
+            or NO_NEWS in research
+            or _env("RESEARCHER_MODEL") == "no_research"
+        ):
+            return research
+        wiki_text = await self._wiki.research(question)
+        if not wiki_text:
+            return research
+        self._wiki_parts[str(question.page_url)] = wiki_text.strip()
+        joined = wiki_research.join_research(research, wiki_text)
+        logger.info(f"Research with Wikipedia for URL {question.page_url}:\n{joined}")
+        return joined
+
+    async def summarize_research(self, question: MetaculusQuestion, research: str) -> str:
+        """The summary isn't used to forecast (use_research_summary_to_forecast
+        is off) but goes in the report; leave the Wikipedia text out of it to
+        save summarizer tokens."""
+        wiki_text = self._wiki_parts.get(str(question.page_url))
+        if wiki_text and research.endswith(wiki_text):
+            research = research[: -len(wiki_text)].strip()
+            if not research:
+                return "Research was Wikipedia articles only; not summarized."
+        return await super().summarize_research(question, research)
 
     def _pick_forecaster(self) -> GeneralLlm | None:
         if not self._forecasters:
@@ -509,6 +666,7 @@ def main() -> None:
         parser.error("--max-questions needs --mode test_questions and a number of at least 1")
     try:
         effort = reasoning_effort()  # checked even if FORECASTER_MODELS is unset
+        wiki_mode = wiki_research_mode()
         max_tokens = forecaster_max_tokens(effort)
     except ValueError as exc:
         sys.exit(str(exc))
@@ -516,6 +674,8 @@ def main() -> None:
         logger.info(f"Reasoning effort for OpenRouter forecasters: {effort}")
     if max_tokens:
         logger.info(f"Max tokens for OpenRouter forecasters: {max_tokens}")
+    if wiki_mode != "off":
+        logger.info(f"Wikipedia research: {wiki_mode}")
 
     if uses_claude_cli():
         try:

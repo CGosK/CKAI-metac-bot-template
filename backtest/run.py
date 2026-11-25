@@ -39,6 +39,10 @@ RUNS = Path(__file__).resolve().parent / "runs"
 PLAN = ROOT / "benchmarks" / "PLAN-backtest.md"
 RESEARCH_PLAN = ROOT / "benchmarks" / "PLAN-research-backtest.md"
 WIKI_PLAN = ROOT / "benchmarks" / "PLAN-wikipedia-research.md"
+LIVE_WIKI_PLAN = ROOT / "benchmarks" / "PLAN-live-wikipedia.md"
+COMBO_IDS = ROOT / "benchmarks" / "combo-ids.json"
+COMBO_IDS_SHA256 = "30a26a105ea5640472d0bd478c29176cc48ced47643cd66c65ee1bfeab239b25"
+COMBO_SOURCES = ("research2", "wiki")  # stored AskNews and Wikipedia research
 FORECASTER = "claude-cli/claude-opus-5-5"
 HELPER = "claude-cli/claude-haiku-5-5"
 # Claude Code appends the real date to every system prompt and has no switch to
@@ -128,7 +132,8 @@ def _git(*args: str) -> str:
 
 
 def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
-    plan = {"asknews-historical": RESEARCH_PLAN, "wikipedia": WIKI_PLAN}.get(args.research, PLAN)
+    plan = {"asknews-historical": RESEARCH_PLAN, "wikipedia": WIKI_PLAN,
+            "combined": LIVE_WIKI_PLAN}.get(args.research, PLAN)
     if args.sample:  # the drift check belongs to the Wikipedia plan
         plan = WIKI_PLAN
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
@@ -167,6 +172,10 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         lines["user_agent"] = wiki.USER_AGENT
         lines["mwparserfromhell_version"] = pkg_version("mwparserfromhell")
         lines["wiki_py_sha256"] = _sha256(Path(wiki.__file__))
+    if args.research == "combined":
+        lines["combined_from"] = ", ".join(f"runs/{b}/research.jsonl" for b in COMBO_SOURCES)
+        lines["combined_join"] = "wiki_research.join_research (the live bot's join)"
+        lines["combo_ids_sha256"] = COMBO_IDS_SHA256
     if args.research == "asknews-historical":
         from importlib.metadata import version as pkg_version
 
@@ -192,6 +201,37 @@ def done_counts(path: Path) -> dict[str, int]:
             if row.get("prediction") is not None:
                 counts[row["id"]] = counts.get(row["id"], 0) + 1
     return counts
+
+
+def stored_research(batch: str) -> dict[str, dict]:
+    rows = {}
+    for line in (RUNS / batch / "research.jsonl").read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "text" in row and not row.get("error"):
+            rows[row["id"]] = row
+    return rows
+
+
+def combined_row(qid: str, news: dict, wiki_rows: dict) -> dict:
+    """The stored AskNews text, then the stored Wikipedia text, joined the way
+    the live bot joins them. No fetching."""
+    from wiki_research import join_research
+
+    if qid not in news or qid not in wiki_rows:
+        raise ValueError(f"{qid}: both stored texts are needed for the combined arm")
+    return {"text": join_research(news[qid]["text"], wiki_rows[qid]["text"]),
+            "sources": list(COMBO_SOURCES)}
+
+
+def combo_ids() -> list[str]:
+    """The pre-registered ids; the hash is of the ids joined by newlines."""
+    ids = json.loads(COMBO_IDS.read_text())
+    if hashlib.sha256("\n".join(ids).encode()).hexdigest() != COMBO_IDS_SHA256:
+        sys.exit("benchmarks/combo-ids.json changed since it was pre-registered.")
+    return ids
 
 
 async def forecast_one(bot, q: dict, k: int, research: str = "") -> dict:
@@ -243,6 +283,15 @@ async def run_batch(
             return await wiki.research_for(q, helper)
 
         store = ResearchStore(batch_dir / "research.jsonl", fetcher=wiki_fetch, serial=False)
+    elif research_mode == "combined":
+        from backtest.research import ResearchStore
+
+        news, wiki_rows = (stored_research(b) for b in COMBO_SOURCES)
+
+        async def combined_fetch(q: dict) -> dict:
+            return combined_row(q["id"], news, wiki_rows)
+
+        store = ResearchStore(batch_dir / "research.jsonl", fetcher=combined_fetch, serial=False)
     slots = asyncio.Semaphore(parallel)
 
     async def do_question(q: dict) -> None:
@@ -339,7 +388,8 @@ def main() -> None:
     parser.add_argument("--predictions", type=int, default=5)
     parser.add_argument("--parallel", type=int, default=3, help="questions at a time")
     parser.add_argument("--probe-date", action="store_true")
-    parser.add_argument("--research", choices=["none", "asknews-historical", "wikipedia"], default="none")
+    parser.add_argument("--research", choices=["none", "asknews-historical", "wikipedia", "combined"],
+                        default="none")
     parser.add_argument("--sample", type=int, default=None, help="a seeded random sample of this many questions")
     parser.add_argument("--probe-wiki", type=int, default=None, metavar="N",
                         help="Wikipedia research only, for the first N questions; prints it, saves nothing")
@@ -375,6 +425,11 @@ def main() -> None:
 
         picked = set(q["id"] for q in random.Random(SAMPLE_SEED).sample(chosen, args.sample))
         chosen = [q for q in chosen if q["id"] in picked]
+    if args.research == "combined":  # only the pre-registered questions with both texts
+        wanted = set(combo_ids())
+        chosen = [q for q in chosen if q["id"] in wanted]
+        if len(chosen) != len(wanted):
+            sys.exit("Some pre-registered combined-arm questions aren't in the chosen range.")
 
     batch_dir = RUNS / args.batch
     if batch_dir.exists() and not args.resume:

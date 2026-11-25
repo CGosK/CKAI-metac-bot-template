@@ -247,17 +247,22 @@ def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: i
 
 def compare(
     questions: list[dict], base: dict[str, list[float]], other: dict[str, list[float]], k: int,
-    research: dict[str, dict] | None = None,
+    research: dict[str, dict] | None = None, base_k: int = 5, min_gain: float | None = None,
 ) -> dict:
     """Paired gain of `other` (median of k) over `base` (expected median of k of
-    its saved predictions). Positive gain: `other` scores better."""
-    ids = [q["id"] for q in questions if len(other.get(q["id"], [])) >= k and len(base.get(q["id"], [])) >= 5]
+    its first base_k saved predictions). Positive gain: `other` scores better.
+
+    Pass rule: by default the research plans' (gain at least 0.01 and the 95%
+    interval above 0). With min_gain, the live-Wikipedia plan's harm check:
+    gain at least min_gain, no interval condition."""
+    ids = [q["id"] for q in questions
+           if len(other.get(q["id"], [])) >= k and len(base.get(q["id"], [])) >= base_k]
     full = [dict(q) for q in questions if q["id"] in ids]
     cluster_of = clusters(full)
     y = {q["id"]: q["outcome"] for q in full}
     crowd = {q["id"]: q["crowd"] for q in full}
     med = {i: statistics.median(other[i][:k]) for i in ids}
-    base_b = {i: subsample_brier(base[i][:5], k, y[i]) for i in ids}
+    base_b = {i: subsample_brier(base[i][:base_k], k, y[i]) for i in ids}
     other_b = {i: brier(med[i], y[i]) for i in ids}
     diffs = {i: base_b[i] - other_b[i] for i in ids}
     mean, lo, hi, p = group_bootstrap(diffs, cluster_of)
@@ -276,12 +281,14 @@ def compare(
             "crowd": statistics.fmean(brier(crowd[i], y[i]) for i in ids),
         },
         "gain": {"mean": mean, "ci95": [lo, hi], "p": p},
-        # Pre-registered rule: gain at least 0.01 and the interval excludes 0.
-        "passes": mean >= 0.01 and lo > 0,
+        "rule": (f"gain >= {min_gain}" if min_gain is not None
+                 else "gain >= 0.01 and 95% interval above 0"),
+        "passes": (mean >= min_gain) if min_gain is not None else (mean >= 0.01 and lo > 0),
         "mean_forecast": statistics.fmean(med.values()),
         "yes_rate": statistics.fmean(y.values()),
         "mean_abs_from_crowd": {
-            "baseline_median_of_5": statistics.fmean(abs(statistics.median(base[i][:5]) - crowd[i]) for i in ids),
+            f"baseline_median_of_{base_k}": statistics.fmean(
+                abs(statistics.median(base[i][:base_k]) - crowd[i]) for i in ids),
             "compared": statistics.fmean(abs(med[i] - crowd[i]) for i in ids),
         },
     }
@@ -325,6 +332,9 @@ def main() -> None:
     parser.add_argument("batches", nargs="+")
     parser.add_argument("--predictions", type=int, default=5)
     parser.add_argument("--compare", help="batch to compare against the baseline batches")
+    parser.add_argument("--base-k", type=int, default=5, help="baseline predictions per question to use")
+    parser.add_argument("--min-gain", type=float, default=None,
+                        help="pass rule: gain at least this, no interval condition (default: the research rule)")
     args = parser.parse_args()
     meta, questions, preds = load(args.batches)
     if args.compare:
@@ -338,7 +348,7 @@ def main() -> None:
                 except json.JSONDecodeError:  # a line cut short by a hard kill
                     continue
                 research[row["id"]] = row
-        result = compare(questions, preds, other, args.predictions, research)
+        result = compare(questions, preds, other, args.predictions, research, args.base_k, args.min_gain)
         result["baseline"], result["compared"] = args.batches, args.compare
         OUT.mkdir(exist_ok=True)
         path = OUT / f"compare-{'+'.join(args.batches)}-vs-{args.compare}.json"
