@@ -733,3 +733,31 @@ def test_score_refuses_a_reverse_batch(monkeypatch, tmp_path):
     _fake_batch(tmp_path, "rev", {"questions_sha256": meta["sha256"], "reverse": "P(No) asked (round 4, X1)"}, [])
     with pytest.raises(SystemExit, match="P\\(No\\)"):
         score.load(["rev"])
+
+
+def test_round3_election_rule_matches_explore_errors_without_running_it(tmp_path, monkeypatch):
+    from backtest import round3_verdict
+
+    out = score.HERE / "out" / "errors-wiki.json"
+    before = out.stat().st_mtime_ns if out.exists() else None
+    rule = round3_verdict.election_rule()
+    assert (out.stat().st_mtime_ns if out.exists() else None) == before  # nothing written
+    assert rule({"question": "Will the Democrats win the Senate election?"})
+    assert not rule({"question": "Will the Yankees win the World Series election of champions?"})  # sports first
+    assert not rule({"question": "Will Bitcoin close above $100k?"})
+
+
+def test_round3_batch_state_flags_a_running_batch(tmp_path, monkeypatch):
+    from backtest import round3_verdict
+
+    monkeypatch.setattr(score, "RUNS", tmp_path)
+    meta = json.loads(score.QUESTIONS.read_text())
+    for name, ended in (("done", True), ("running", False)):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "launch.txt").write_text(
+            f"questions_sha256: {meta['sha256']}\n" + ("utc_end: 2026-11-25T00:00:00+00:00\n" if ended else ""))
+        (tmp_path / name / "predictions.jsonl").write_text(
+            "".join(json.dumps({"id": meta["questions"][0]["id"], "k": k, "prediction": 0.4}) + "\n"
+                    for k in range(3)))
+    assert round3_verdict.batch_state("done")["partial"] is False
+    assert round3_verdict.batch_state("running")["partial"] is True
