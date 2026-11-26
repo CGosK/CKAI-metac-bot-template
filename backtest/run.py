@@ -48,6 +48,8 @@ ROUND2_AMEND = ROOT / "benchmarks" / "PLAN-refine-round2-amend1.md"
 ROUND3_PLAN = ROOT / "benchmarks" / "PLAN-refine-round3.md"
 ROUND4_PLAN = ROOT / "benchmarks" / "PLAN-refine-round4.md"
 ROUND5_PLAN = ROOT / "benchmarks" / "PLAN-refine-round5.md"
+ROUND6_PLAN = ROOT / "benchmarks" / "PLAN-refine-round6-levels.md"
+DATA_BLOCK_PLAN = ROUND5_PLAN  # the plan hashed into --data-block launches; round-6 item files switch it (main)
 DATA_BLOCKS = ("off", "fb", "ours")  # round 5: A0 no value, A1 ForecastBench's value, A2 our dated block
 # Forecasters the backtest may use, with their stated training cutoffs. Freezes start Aug 1, 2026.
 FORECASTERS = {
@@ -184,7 +186,7 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
     if args.evidence or args.reverse:
         plan = ROUND4_PLAN
     if args.data_block:
-        plan = ROUND5_PLAN
+        plan = DATA_BLOCK_PLAN
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
     lines = {
         "command": " ".join(shlex.quote(a) for a in sys.argv),
@@ -298,10 +300,10 @@ def check_resume_settings(first_launch: str, args: argparse.Namespace) -> str | 
         return "--data-block differs from this batch's first launch."
     if args.data_block and lines.get("data_research_sha256") != _sha256(ROOT / "data_research.py"):
         return "data_research.py changed since this batch's first launch."
-    if args.data_block and not ROUND5_PLAN.exists():
-        return "the round-5 plan (benchmarks/PLAN-refine-round5.md) is missing; it is hashed into every launch."
-    if args.data_block and lines.get("plan_sha256") != _sha256(ROUND5_PLAN):
-        return "the round-5 plan changed since this batch's first launch."
+    if args.data_block and not DATA_BLOCK_PLAN.exists():
+        return f"the plan (benchmarks/{DATA_BLOCK_PLAN.name}) is missing; it is hashed into every launch."
+    if args.data_block and lines.get("plan_sha256") != _sha256(DATA_BLOCK_PLAN):
+        return f"the plan ({DATA_BLOCK_PLAN.name}) changed since this batch's first launch."
     return None
 
 
@@ -686,6 +688,9 @@ def main() -> None:
         parser.error("--batch is required")
 
     meta = json.loads(QUESTIONS.read_text())
+    if meta.get("round") == 6:  # round-6 level items (backtest.round6) are hashed against their own plan
+        global DATA_BLOCK_PLAN
+        DATA_BLOCK_PLAN = ROUND6_PLAN
     questions = meta["questions"]
     end = None if args.limit is None else args.start + args.limit
     chosen = questions[args.start : end]
