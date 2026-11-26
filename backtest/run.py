@@ -298,12 +298,15 @@ def check_resume_settings(first_launch: str, args: argparse.Namespace) -> str | 
         return "--data-block differs from this batch's first launch."
     if args.data_block and lines.get("data_research_sha256") != _sha256(ROOT / "data_research.py"):
         return "data_research.py changed since this batch's first launch."
+    if args.data_block and lines.get("plan_sha256") != _sha256(ROUND5_PLAN):
+        return "the round-5 plan changed since this batch's first launch."
     return None
 
 
 def _number_forms(x: float) -> list[str]:
     """Ways a value may be written in background text: as stored, without a trailing .0, with commas."""
-    forms = {repr(float(x)), f"{x:g}", f"{x:,}", f"{x:,.2f}", f"{x:.2f}"}
+    forms = {repr(float(x)), f"{x:g}", f"{x:,}", f"{x:,.2f}", f"{x:.2f}", f"{x:.3f}", f"{x:,.3f}"}
+    forms |= {f.replace("-", "\u2212") for f in forms if f.startswith("-")}
     if float(x).is_integer():
         forms |= {str(int(x)), f"{int(x):,}"}
     return sorted((f for f in forms if len(f.replace(",", "").replace(".", "")) >= 2), key=len, reverse=True)
@@ -315,7 +318,10 @@ def scrub_value(text: str, value: float) -> tuple[str, int]:
 
     count = 0
     for form in _number_forms(value):
-        text, n = re.subn(rf"(?<![\d.,]){re.escape(form)}(?!\d|\.\d)", "[value removed]", text)
+        # Not part of a longer number or a date (2026-09-20), and not followed by a unit of time ("10 years").
+        pattern = (rf"(?<![\d.,\-/]){re.escape(form)}(?![\d\-/]|\.\d)"
+                   + (r"(?!\s*(?:years?|months?|weeks?|days?)\b)" if "." not in form and "," not in form else ""))
+        text, n = re.subn(pattern, "[value removed]", text)
         count += n
     return text, count
 
@@ -340,8 +346,8 @@ def data_block_text(q: dict, mode: str, http=None) -> dict:
     freeze = datetime.fromisoformat(q["freeze_datetime"])
     try:
         series = [dr.series_for(q["source"], q["series_id"], freeze, http)]
-    except dr.DataAuthError:
-        raise
+    except (dr.DataAuthError, dr.DataTransient):
+        raise  # a transient failure fails this question (retried on resume) rather than storing "no data"
     except dr.DataUnavailable as exc:
         return {"text": dr.format_block([], freeze), "arm": "A2", "error": dr.redact(str(exc))[:300]}
     return {"text": dr.format_block(series, freeze), "arm": "A2", "rows": len(series[0].rows),

@@ -362,9 +362,7 @@ def compare(
     diffs = {i: base_b[i] - other_b[i] for i in ids}
     stat = cluster_t if test == "cluster-t" else group_bootstrap
     mean, lo, hi, p = stat(diffs, cluster_of)
-    cluster_mean = None
-    if test == "cluster-t":  # the gain stays the mean over questions; interval and p from cluster means
-        cluster_mean, mean = mean, statistics.fmean(diffs.values())
+    question_mean = statistics.fmean(diffs.values())  # reported alongside; with cluster-t the rule uses `mean`
     # The tournament's score is log-based: lower log loss is better, so gain = baseline - compared.
     log_diffs = {i: subsample_log(base[i][:base_k], k, y[i]) - log_score(med[i], y[i]) for i in ids}
     lmean, llo, lhi, lp = stat(log_diffs, cluster_of)
@@ -384,13 +382,16 @@ def compare(
                       if all(crowd[i] is not None for i in ids) else None),
         },
         "gain": {"mean": mean, "ci95": [lo, hi], "p": p},
-        "test": ("t-test on cluster means (df = clusters - 1); gain is the mean over questions, interval and "
-                 "p are for the mean of cluster means" if test == "cluster-t" else "cluster bootstrap"),
-        "mean_of_cluster_means": cluster_mean,
+        "test": ("t-test on cluster means (df = clusters - 1); gain, interval, p and the rule are all for the "
+                 "mean of cluster means" if test == "cluster-t" else "cluster bootstrap"),
+        "mean_over_questions": question_mean,
         "log_gain": {"mean": lmean, "ci95": [llo, lhi], "p": lp},
         "rule": (f"gain >= {min_gain}" if min_gain is not None
+                 else "gain >= 0.01, p < 0.05 and log gain >= 0" if test == "cluster-t"
                  else "gain >= 0.01 and 95% interval above 0"),
-        "passes": (mean >= min_gain) if min_gain is not None else (mean >= 0.01 and lo > 0),
+        "passes": ((mean >= min_gain) if min_gain is not None
+                   else (mean >= 0.01 and p < 0.05 and lmean >= 0) if test == "cluster-t"
+                   else (mean >= 0.01 and lo > 0)),
         "mean_forecast": statistics.fmean(med.values()),
         "yes_rate": statistics.fmean(y.values()),
         "mean_abs_from_crowd": None if any(crowd[i] is None for i in ids) else {

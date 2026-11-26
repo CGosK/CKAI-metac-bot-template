@@ -91,8 +91,10 @@ def test_dbnomics_skips_na_and_cuts_with_lag():
     http = FakeHttp({"https://api.db.nomics.world/": db_payload(days, [0.05, "NA", 0.06, 0.07, 0.5, 0.6])})
     s = dr.dbnomics("ECB", "CISS", "D.IT.Z0Z.4F.EC.SS_CIN.IDX", T, http, lag_days=0)
     assert [d.isoformat() for d, _ in s.rows] == ["2026-07-30", "2026-08-03", "2026-08-05"]
-    daily = dr.dbnomics("ECB", "CISS", "D.IT.Z0Z.4F.EC.SS_CIN.IDX", T, http)  # the plan's daily lag: 2 days
+    daily = dr.dbnomics("ECB", "EXR", "D.USD.EUR.SP00.A", T, http)  # the plan's daily lag: 2 days
     assert [d.isoformat() for d, _ in daily.rows] == ["2026-07-30", "2026-08-03"]
+    with pytest.raises(dr.DataUnavailable):  # CISS is released weekly: 14 days, nothing left here
+        dr.dbnomics("ECB", "CISS", "D.IT.Z0Z.4F.EC.SS_CIN.IDX", T, http)
     s2 = dr.dbnomics("ECB", "CISS", "D.IT.Z0Z.4F.EC.SS_CIN.IDX", T, http, lag_days=3)
     assert [d.isoformat() for d, _ in s2.rows] == ["2026-07-30"]
     assert "metadata=false" in http.calls[0]

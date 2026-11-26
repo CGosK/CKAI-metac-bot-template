@@ -51,13 +51,14 @@ def test_redact_removes_key_from_urls_and_messages():
     assert FAKE_KEY not in dr.redact(url) and "api_key=REDACTED&file_type" in dr.redact(url)
 
 
-def test_fred_uses_vintage_day_before_t_and_cuts(monkeypatch):
+def test_fred_uses_last_full_central_day_before_t_and_cuts(monkeypatch):
     monkeypatch.setenv("FRED_API_KEY", FAKE_KEY)
     http = FakeHttp(fred_handler([("2026-08-03", "4.1"), ("2026-08-04", "."), ("2026-08-05", "4.2"),
                                   ("2026-08-06", "9.9")]))
     s = dr.fred("DGS10", T, http)
     obs_url = next(u for u in http.calls if u.startswith(dr.FRED_OBS))
-    assert "realtime_start=2026-08-05" in obs_url and "realtime_end=2026-08-05" in obs_url
+    # T is 00:00 UTC on 08-06, i.e. the evening of 08-05 in Chicago: the last full Central day is 08-04.
+    assert "realtime_start=2026-08-04" in obs_url and "realtime_end=2026-08-04" in obs_url
     assert "observation_start=" in obs_url
     assert s.rows == [(date(2026, 8, 3), 4.1), (date(2026, 8, 5), 4.2)]  # "." skipped, T's row cut
     assert s.vintage == "vintage" and s.units == "Percent"
@@ -173,7 +174,7 @@ def test_f1_agree_disagree_and_later(monkeypatch):
     later = round5.f1_item(item(), FakeHttp(fred_handler([("2026-08-04", "4.2"), ("2026-08-05", "4.3")])))
     assert later["status"] == "later" and later["our_minus_fb_days"] == 1
     off = round5.f1_item(item(), FakeHttp(fred_handler([("2026-08-05", "5.0")])))
-    assert off["status"] == "disagree" and off["fb_value_date"] is None
+    assert off["status"] == "undetermined" and off["fb_value_date"] is None
     summary = round5.f1_summary([agree, later, off])
     assert summary["all"]["agree"] == 1 and summary["all"]["later_than_fb"] == 1 and not summary["passes"]
 
@@ -254,10 +255,12 @@ def test_resume_refuses_changed_data_block():
     ns = argparse.Namespace(forecaster="claude-cli/claude-opus-5-5", effort="high", prompt="template",
                             evidence=False, reverse=False, data_block="ours")
     sha = run._sha256(run.ROOT / "data_research.py")
-    first = f"data_block: ours\ndata_research_sha256: {sha}\n"
+    first = (f"data_block: ours\ndata_research_sha256: {sha}\n"
+             f"plan_sha256: {run._sha256(run.ROUND5_PLAN)}\n")
     assert run.check_resume_settings(first, ns) is None
     assert "data-block" in run.check_resume_settings(first.replace("ours", "off", 1), ns)
     assert "changed" in run.check_resume_settings(first.replace(sha, "0" * 64), ns)
+    assert "plan" in run.check_resume_settings(first.replace(run._sha256(run.ROUND5_PLAN), "0" * 64), ns)
 
 
 def test_pilot_ids_spread_across_clusters_and_are_stable():
@@ -277,3 +280,41 @@ def test_pilot_ids_refuses_more_than_there_are():
 
     with pytest.raises(ValueError):
         run.pilot_ids([{"id": "x", "cluster": "a"}], 2)
+
+
+def test_fred_vintage_in_central_time():
+    from datetime import datetime, timezone
+
+    assert dr.fred_vintage(datetime(2026, 10, 9, tzinfo=timezone.utc)) == date(2026, 10, 7)
+    assert dr.fred_vintage(datetime(2026, 10, 9, 12, tzinfo=timezone.utc)) == date(2026, 10, 8)  # 07:00 CDT
+    assert dr.fred_vintage(date(2026, 10, 9)) == date(2026, 10, 7)
+
+
+def test_f1_repeated_value_dates_forecastbench_by_the_run_start(monkeypatch):
+    monkeypatch.setenv("FRED_API_KEY", FAKE_KEY)
+    # ForecastBench's 4.2 holds on 08-01 and 08-02; ours ends at 08-04 with 4.3: later by 3 days, not 2.
+    rows = [("2026-08-01", "4.2"), ("2026-08-02", "4.2"), ("2026-08-04", "4.3")]
+    r = round5.f1_item(item(), FakeHttp(fred_handler(rows)))
+    assert r["status"] == "later" and r["fb_value_date"] == "2026-08-01" and r["our_minus_fb_days"] == 3
+
+
+def test_a2_transient_fetch_failure_is_not_stored_as_no_data(monkeypatch):
+    def boom(*a, **k):
+        raise dr.DataTransient("timeout")
+
+    monkeypatch.setattr(dr, "series_for", boom)
+    with pytest.raises(dr.DataTransient):
+        run.data_block_text(item(), "ours")
+
+    def gone(*a, **k):
+        raise dr.DataUnavailable("not found")
+
+    monkeypatch.setattr(dr, "series_for", gone)
+    assert run.data_block_text(item(), "ours")["error"] == "not found"
+
+
+def test_scrub_trailing_zeros_unicode_minus_and_not_dates_or_durations():
+    assert run.scrub_value("was 4.330 then", 4.33)[1] == 1
+    assert run.scrub_value("fell to \u22120.5 today", -0.5)[1] == 1
+    text, n = run.scrub_value("on 2026-09-20 the index, over the past 20 years, read 20.", 20.0)
+    assert n == 1 and "2026-09-20" in text and "20 years" in text

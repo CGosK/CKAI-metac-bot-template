@@ -96,16 +96,30 @@ def f1_item(item: dict, http) -> dict:
     last_d, last_v = s.rows[-1]
     matches = [d for d, v in rows if same_value(v, item["freeze_value"], places)]
     before_t = [d for d in matches if d < t.date()]
-    fb_date = max(before_t) if before_t else None
+    # ForecastBench gives no date for its value: take the latest run of consecutive rows (before T) holding it,
+    # and date it by the run's first row, so a repeated value never dates ForecastBench later than it could be.
+    fb_date, ambiguous = None, False
+    if before_t:
+        dates = [d for d, _ in rows if d < t.date()]
+        i = dates.index(max(before_t))
+        while i > 0 and dates[i - 1] in set(before_t):
+            i -= 1
+        fb_date = dates[i]
+        ambiguous = any(d < fb_date for d in before_t)  # the value also appears earlier, apart from this run
     out.update(our_date=last_d.isoformat(), our_value=last_v, cutoff=s.cutoff.isoformat(), places=places,
                agree=same_value(last_v, item["freeze_value"], places),
-               fb_value_date=fb_date.isoformat() if fb_date else None,
+               fb_value_date=fb_date.isoformat() if fb_date else None, fb_value_date_ambiguous=ambiguous,
                fb_value_only_after_t=bool(matches) and not before_t,
                fb_value_in_our_rows=any(same_value(v, item["freeze_value"], places) for _, v in s.rows))
     if fb_date is not None:
         out["our_minus_fb_days"] = (last_d - fb_date).days
         out["later_than_fb"] = last_d > fb_date
-    out["status"] = "agree" if out["agree"] else ("later" if out.get("later_than_fb") else "disagree")
+    if out["agree"]:
+        out["status"] = "agree"  # our last row holds ForecastBench's value, so it is not later than theirs
+    elif fb_date is None:
+        out["status"] = "undetermined"  # value not found before T: the leak check can't run
+    else:
+        out["status"] = "later" if out["later_than_fb"] else "disagree"
     return out
 
 
@@ -118,6 +132,8 @@ def f1_summary(rows: list[dict]) -> dict:
             "agree": sum(r["agree"] for r in ok),
             "agree_share_of_fetched": round(sum(r["agree"] for r in ok) / len(ok), 4) if ok else None,
             "later_than_fb": sum(bool(r.get("later_than_fb")) for r in ok),
+            "undetermined": sum(r["status"] == "undetermined" for r in ok),
+            "fb_date_ambiguous": sum(bool(r.get("fb_value_date_ambiguous")) for r in ok),
             "fb_value_only_after_t": sum(r["fb_value_only_after_t"] for r in ok),
             "fb_value_not_found": sum(r["fb_value_date"] is None and not r["fb_value_only_after_t"] for r in ok),
             "disagree_but_fb_value_in_our_rows": sum((not r["agree"]) and r["fb_value_in_our_rows"] for r in ok),
@@ -126,9 +142,14 @@ def f1_summary(rows: list[dict]) -> dict:
         }
 
     by_source = {src: part([r for r in rows if r["source"] == src]) for src in sorted({r["source"] for r in rows})}
+
+    def family(r: dict) -> str:  # DBnomics provider/dataset; "later" is judged per family against release timing
+        return r["source"] if r["source"] != "dbnomics" else "dbnomics:" + "/".join(r["series_id"].split("_", 2)[:2])
+
+    later_by_family = _count(family(r) for r in rows if r.get("later_than_fb"))
     whole = part(rows)
     share = whole["agree_share_of_fetched"]
-    return {"all": whole, "by_source": by_source,
+    return {"all": whole, "by_source": by_source, "later_by_family": later_by_family,
             "pass_rule": f">= {F1_PASS:.0%} of items agree to the stated precision and none later than ForecastBench's",
             "passes": bool(share is not None and share >= F1_PASS and whole["later_than_fb"] == 0
                            and whole["unavailable"] == 0)}

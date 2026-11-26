@@ -60,6 +60,9 @@ FRED_OBS = "https://api.stlouisfed.org/fred/series/observations"
 FRED_SERIES = "https://api.stlouisfed.org/fred/series"
 # Days from a period's start date before its value is assumed published (plan, Step 0).
 DBNOMICS_LAG_DAYS = {"daily": 2, "weekly": 14, "monthly": 60, "quarterly": 120, "annual": 400}
+# Datasets published later than their frequency suggests (code review, Nov 26): the larger lag applies.
+# ECB CISS is a daily index released weekly.
+DBNOMICS_DATASET_LAG_DAYS = {("ECB", "CISS"): 14}
 CACHE_DIR = Path(os.environ.get("DATA_RESEARCH_CACHE", Path.home() / ".cache" / "ckai-bot-data"))
 _KEY_PARAM = re.compile(r"(api_key=)[^&\s]+")
 TREASURY_TENORS = ("1 Mo", "1.5 Month", "2 Mo", "3 Mo", "4 Mo", "6 Mo", "1 Yr", "2 Yr", "3 Yr", "5 Yr",
@@ -74,6 +77,10 @@ class DataLeak(RuntimeError):
 
 class DataUnavailable(RuntimeError):
     """The source refused, failed, or has no rows before T."""
+
+
+class DataTransient(DataUnavailable):
+    """A network or server failure (timeout, 5xx, 429): retry later; never stored as "no data"."""
 
 
 class DataAuthError(DataUnavailable):
@@ -125,10 +132,11 @@ class PoliteHttp:
                 body = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:300].decode("utf-8", "replace")
-            cls = DataAuthError if "api_key" in detail.lower() or exc.code in (401, 403) else DataUnavailable
+            cls = (DataAuthError if "api_key" in detail.lower() or exc.code in (401, 403)
+                   else DataTransient if exc.code == 429 or exc.code >= 500 else DataUnavailable)
             raise cls(redact(f"{url}: HTTP {exc.code}: {detail}")) from None
         except Exception as exc:
-            raise DataUnavailable(redact(f"{url}: {exc}")) from None
+            raise DataTransient(redact(f"{url}: {exc}")) from None
         finally:
             self._last = time.monotonic()
         if path is not None:
@@ -219,7 +227,7 @@ def dbnomics(provider: str, dataset: str, series: str, freeze: datetime | date, 
         frequency = doc.get("@frequency", "")
         if frequency not in DBNOMICS_LAG_DAYS:
             raise DataUnavailable(f"DBnomics {provider}/{dataset}/{series}: no lag rule for frequency {frequency!r}")
-        lag_days = DBNOMICS_LAG_DAYS[frequency]
+        lag_days = max(DBNOMICS_LAG_DAYS[frequency], DBNOMICS_DATASET_LAG_DAYS.get((provider, dataset), 0))
     kept, cutoff = _cut(rows, freeze, lag_days)
     if not kept:
         raise DataUnavailable(f"DBnomics {provider}/{dataset}/{series}: no values before {cutoff}")
@@ -282,10 +290,21 @@ def fred_info(series_id: str, http: Http) -> dict:
     return seriess[0]
 
 
+def fred_vintage(freeze: datetime | date) -> date:
+    """ALFRED's realtime dates are US Central days, and a vintage holds what was posted by the end of that day.
+    The last full Central day before T: a 00:00 UTC freeze is 18:00-19:00 the previous Central day, so the
+    vintage is two calendar days before T's UTC date (an evening posting on T-1 Central is after T)."""
+    if isinstance(freeze, datetime) and freeze.tzinfo is not None:
+        from zoneinfo import ZoneInfo
+
+        return freeze.astimezone(ZoneInfo("America/Chicago")).date() - timedelta(days=1)
+    return _as_date(freeze) - timedelta(days=2)  # no time zone: assume 00:00 UTC, as ForecastBench freezes
+
+
 def fred(series_id: str, freeze: datetime | date, http: Http) -> Series:
-    """A FRED series as it was published the day before T (ALFRED), rows dated before T."""
-    t = _as_date(freeze)
-    vintage = t - timedelta(days=1)
+    """A FRED series as it was published by the last full US Central day before T (ALFRED), rows dated
+    before T."""
+    vintage = fred_vintage(freeze)
     info = fred_info(series_id, http)
     kept, cutoff = _cut(fred_vintage_rows(series_id, vintage, http), freeze, 0)
     if not kept:
