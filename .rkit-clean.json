@@ -1,5 +1,15 @@
 {
   "allow": [
-    {"path": "pyproject.toml", "label": "email", "reason": "Upstream template author's address, already public in Metaculus's metac-bot-template"}
+    {
+      "path": "pyproject.toml",
+      "label": "email",
+      "reason": "Upstream template author's address, already public in Metaculus's metac-bot-template"
+    },
+    {
+      "path": "backtest/model_check.py",
+      "label": "token or cost counts",
+      "match": "modelUsage",
+      "reason": "Field name in code that reads local call logs to check which model answered; no counts are committed. Removed from the file in a later commit, allowed for the earlier commits in history."
+    }
   ]
 }
