@@ -38,7 +38,7 @@ def check(batch: str) -> dict:
                     continue
                 if isinstance(row, dict) and row.get("type") == "result":
                     results += 1
-                    for m, u in (row.get("model_usage_since_last_result") or row.get("modelUsage") or {}).items():
+                    for m, u in (row.get("model_usage_since_last_result") or {}).items():
                         here[m] += u.get("outputTokens", 0)
             if forecaster:
                 files += 1
