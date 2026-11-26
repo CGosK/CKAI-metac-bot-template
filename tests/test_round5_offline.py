@@ -258,3 +258,22 @@ def test_resume_refuses_changed_data_block():
     assert run.check_resume_settings(first, ns) is None
     assert "data-block" in run.check_resume_settings(first.replace("ours", "off", 1), ns)
     assert "changed" in run.check_resume_settings(first.replace(sha, "0" * 64), ns)
+
+
+def test_pilot_ids_spread_across_clusters_and_are_stable():
+    from backtest import run
+
+    items = [{"id": f"{c}-{i}", "cluster": c} for c in "abcde" for i in range(10)]
+    ids = run.pilot_ids(items, 12)
+    assert len(ids) == len(set(ids)) == 12
+    per = {c: sum(i.startswith(c) for i in ids) for c in "abcde"}
+    assert max(per.values()) - min(per.values()) <= 1  # round-robin: every cluster before any gets another
+    assert run.pilot_ids(list(reversed(items)), 12) == ids  # input order doesn't matter
+
+
+def test_pilot_ids_refuses_more_than_there_are():
+    import pytest
+    from backtest import run
+
+    with pytest.raises(ValueError):
+        run.pilot_ids([{"id": "x", "cluster": "a"}], 2)

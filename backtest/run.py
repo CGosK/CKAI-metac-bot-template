@@ -68,6 +68,29 @@ BACKTEST_SYSTEM_PROMPT = (
     "directly in plain text, following any output format it asks for."
 )
 SAMPLE_SEED = 20261125
+PILOT_SEED = "round5-pilot"
+
+
+def pilot_ids(items: list[dict], n: int) -> list[str]:
+    """Round 5 P0: n items spread across clusters. Clusters and the items within each are ordered by a seeded
+    hash, then taken round-robin, so every cluster gets one before any gets two."""
+    import hashlib
+
+    def h(x: str) -> str:
+        return hashlib.sha256(f"{PILOT_SEED}:{x}".encode()).hexdigest()
+
+    by: dict[str, list[str]] = {}
+    for q in items:
+        by.setdefault(q["cluster"], []).append(q["id"])
+    queues = [sorted(ids, key=h) for _, ids in sorted(by.items(), key=lambda kv: h(kv[0]))]
+    out: list[str] = []
+    while len(out) < n and any(queues):
+        for qu in queues:
+            if qu and len(out) < n:
+                out.append(qu.pop(0))
+    if len(out) < n:
+        raise ValueError(f"only {len(out)} items for a pilot of {n}")
+    return out
 
 _freeze_date: contextvars.ContextVar[datetime | None] = contextvars.ContextVar(
     "backtest_freeze_date", default=None
@@ -196,6 +219,10 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
     }
     if args.sample:
         lines["sample"] = f"{args.sample} questions, seed {SAMPLE_SEED}"
+    if args.pilot:
+        lines["pilot"] = f"{args.pilot} items across clusters, seed {PILOT_SEED} (round 5 P0)"
+    if args.exclude_pilot:
+        lines["exclude_pilot"] = f"all items but the {args.exclude_pilot}-item pilot, seed {PILOT_SEED} (round 5 D1)"
     if args.research == "wikipedia":
         from importlib.metadata import version as pkg_version
 
@@ -615,6 +642,9 @@ def main() -> None:
     parser.add_argument("--lookback-days", type=int, help="gdelt: look-back before the freeze, in days")
     parser.add_argument("--freeze-on", help="only questions frozen on these dates (comma-separated YYYY-MM-DD)")
     parser.add_argument("--sample", type=int, default=None, help="a seeded random sample of this many questions")
+    parser.add_argument("--pilot", type=int, default=None, help="round 5 P0: this many items spread across clusters")
+    parser.add_argument("--exclude-pilot", type=int, default=None, metavar="N",
+                        help="round 5 D1: every item except the N-item pilot")
     parser.add_argument("--probe-wiki", type=int, default=None, metavar="N",
                         help="Wikipedia research only, for the first N questions; prints it, saves nothing")
     parser.add_argument("--probe-research", action="store_true",
@@ -669,6 +699,11 @@ def main() -> None:
 
         picked = set(q["id"] for q in random.Random(SAMPLE_SEED).sample(chosen, args.sample))
         chosen = [q for q in chosen if q["id"] in picked]
+    if args.pilot or args.exclude_pilot:
+        if not args.data_block or args.sample or (args.pilot and args.exclude_pilot):
+            parser.error("--pilot / --exclude-pilot: round-5 items with --data-block, one of them, no --sample")
+        pilot = set(pilot_ids(chosen, args.pilot or args.exclude_pilot))
+        chosen = [q for q in chosen if (q["id"] in pilot) == bool(args.pilot)]
     if args.research == "combined":  # only the pre-registered questions with both texts
         wanted = set(combo_ids())
         chosen = [q for q in chosen if q["id"] in wanted]
