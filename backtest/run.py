@@ -620,6 +620,15 @@ def main() -> None:
         sys.exit("--start/--limit/--sample differ from this batch's first launch.")
     ids_path.write_text(json.dumps([q["id"] for q in chosen]))
     write_launch(batch_dir, meta, args)
+    # Recorded at start: a run that is stopped (killed) never reaches the finally block below.
+    from claude_cli_llm import get_backend
+
+    try:
+        logs = str(get_backend().run_dir)
+    except Exception as exc:
+        logs = f"unavailable ({exc})"
+    with open(batch_dir / "launch.txt", "a") as f:
+        f.write(f"call_logs: {logs}\n")
 
     install_date_stub()
     try:
@@ -627,14 +636,7 @@ def main() -> None:
                               args.sources.split(",") if args.sources else None, args.lookback_days,
                               args.reverse))
     finally:
-        from claude_cli_llm import get_backend
-
-        try:
-            logs = str(get_backend().run_dir)
-        except Exception as exc:
-            logs = f"unavailable ({exc})"
         with open(batch_dir / "launch.txt", "a") as f:
-            f.write(f"call_logs: {logs}\n")
             f.write(f"utc_end: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n\n")
 
 
