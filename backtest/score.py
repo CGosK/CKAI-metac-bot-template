@@ -101,7 +101,10 @@ def clusters(questions: list[dict], join_days: int = 0) -> dict[str, str]:
     """Each question's resampling cluster: questions that share a Polymarket
     event group or a resolution date are joined (elections, Fed meetings and
     month-end questions resolve together). Coarse on purpose, so intervals err
-    wide rather than narrow."""
+    wide rather than narrow. Items that carry their own `cluster` (round-5 dataset
+    items: source, freeze date, resolution date) use it as given."""
+    if questions and all(q.get("cluster") for q in questions):
+        return {q["id"]: "c:" + q["cluster"] for q in questions}
     parent: dict[str, str] = {}
 
     def find(x: str) -> str:
@@ -162,6 +165,66 @@ def group_bootstrap(diffs: dict[str, float], groups: dict[str, str]) -> tuple[fl
     below = sum(s <= 0 for s in stats) / BOOTSTRAP
     above = sum(s >= 0 for s in stats) / BOOTSTRAP
     return mean, lo, hi, min(1.0, 2 * min(below, above))
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta I_x(a, b) by continued fraction (Numerical Recipes)."""
+    if x <= 0:
+        return 0.0
+    if x >= 1:
+        return 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1 - x))
+    if x > (a + 1) / (a + b + 2):
+        return 1.0 - _betainc(b, a, 1 - x)
+    c, d = 1.0, 1.0 - (a + b) * x / (a + 1)
+    d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+    f = d
+    for m in range(1, 300):
+        for step in (0, 1):
+            if step == 0:
+                num = m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m))
+            else:
+                num = -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1))
+            d = 1.0 + num * d
+            d = 1.0 / (d if abs(d) > 1e-300 else 1e-300)
+            c = 1.0 + num / c if abs(c) > 1e-300 else 1e-300
+            f *= c * d
+        if abs(c * d - 1) < 1e-12:
+            break
+    return front * f / a
+
+
+def t_two_sided_p(t: float, df: int) -> float:
+    return _betainc(df / 2, 0.5, df / (df + t * t))
+
+
+def t_quantile(q: float, df: int) -> float:
+    """Upper quantile of Student's t by bisection (q in (0.5, 1))."""
+    lo, hi = 0.0, 1000.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if 1 - t_two_sided_p(mid, df) / 2 < q:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def cluster_t(diffs: dict[str, float], groups: dict[str, str]) -> tuple[float, float, float, float]:
+    """Mean of cluster means, its 95% interval and two-sided p from a t-test on cluster means
+    (df = clusters - 1): PLAN-refine-round5.md, where 22 clusters make a percentile bootstrap undercover."""
+    by: dict[str, list[float]] = {}
+    for qid, d in diffs.items():
+        by.setdefault(groups[qid], []).append(d)
+    means = [statistics.fmean(v) for v in by.values()]
+    n = len(means)
+    if n < 2:
+        raise ValueError("cluster_t needs at least two clusters")
+    mean, se = statistics.fmean(means), statistics.stdev(means) / math.sqrt(n)
+    if se == 0:
+        return mean, mean, mean, (1.0 if mean == 0 else 0.0)
+    half = t_quantile(0.975, n - 1) * se
+    return mean, mean - half, mean + half, t_two_sided_p(mean / se, n - 1)
 
 
 def holm(pvalues: dict[str, float]) -> dict[str, float]:
@@ -279,7 +342,7 @@ def analyse(questions: list[dict], preds: dict[str, list[float]], predictions: i
 def compare(
     questions: list[dict], base: dict[str, list[float]], other: dict[str, list[float]], k: int,
     research: dict[str, dict] | None = None, base_k: int = 5, min_gain: float | None = None,
-    join_days: int = 0,
+    join_days: int = 0, test: str = "bootstrap",
 ) -> dict:
     """Paired gain of `other` (median of k) over `base` (expected median of k of
     its first base_k saved predictions). Positive gain: `other` scores better.
@@ -297,10 +360,14 @@ def compare(
     base_b = {i: subsample_brier(base[i][:base_k], k, y[i]) for i in ids}
     other_b = {i: brier(med[i], y[i]) for i in ids}
     diffs = {i: base_b[i] - other_b[i] for i in ids}
-    mean, lo, hi, p = group_bootstrap(diffs, cluster_of)
+    stat = cluster_t if test == "cluster-t" else group_bootstrap
+    mean, lo, hi, p = stat(diffs, cluster_of)
+    cluster_mean = None
+    if test == "cluster-t":  # the gain stays the mean over questions; interval and p from cluster means
+        cluster_mean, mean = mean, statistics.fmean(diffs.values())
     # The tournament's score is log-based: lower log loss is better, so gain = baseline - compared.
     log_diffs = {i: subsample_log(base[i][:base_k], k, y[i]) - log_score(med[i], y[i]) for i in ids}
-    lmean, llo, lhi, lp = group_bootstrap(log_diffs, cluster_of)
+    lmean, llo, lhi, lp = stat(log_diffs, cluster_of)
     sizes: dict[str, int] = {}
     for i in ids:
         sizes[cluster_of[i]] = sizes.get(cluster_of[i], 0) + 1
@@ -313,16 +380,20 @@ def compare(
         "brier": {
             "baseline_median_of_k": statistics.fmean(base_b.values()),
             "compared_median": statistics.fmean(other_b.values()),
-            "crowd": statistics.fmean(brier(crowd[i], y[i]) for i in ids),
+            "crowd": (statistics.fmean(brier(crowd[i], y[i]) for i in ids)
+                      if all(crowd[i] is not None for i in ids) else None),
         },
         "gain": {"mean": mean, "ci95": [lo, hi], "p": p},
+        "test": ("t-test on cluster means (df = clusters - 1); gain is the mean over questions, interval and "
+                 "p are for the mean of cluster means" if test == "cluster-t" else "cluster bootstrap"),
+        "mean_of_cluster_means": cluster_mean,
         "log_gain": {"mean": lmean, "ci95": [llo, lhi], "p": lp},
         "rule": (f"gain >= {min_gain}" if min_gain is not None
                  else "gain >= 0.01 and 95% interval above 0"),
         "passes": (mean >= min_gain) if min_gain is not None else (mean >= 0.01 and lo > 0),
         "mean_forecast": statistics.fmean(med.values()),
         "yes_rate": statistics.fmean(y.values()),
-        "mean_abs_from_crowd": {
+        "mean_abs_from_crowd": None if any(crowd[i] is None for i in ids) else {
             f"baseline_median_of_{base_k}": statistics.fmean(
                 abs(statistics.median(base[i][:base_k]) - crowd[i]) for i in ids),
             "compared": statistics.fmean(abs(med[i] - crowd[i]) for i in ids),
@@ -473,6 +544,8 @@ def main() -> None:
                         help="compare: resolution dates within this many days form one cluster")
     parser.add_argument("--calibrate", action="store_true",
                         help="the calibration test of PLAN-refine-round2.md on the given batch")
+    parser.add_argument("--test", choices=["bootstrap", "cluster-t"], default="bootstrap",
+                        help="compare: interval and p from the cluster bootstrap or a t-test on cluster means")
     parser.add_argument("--min-gain", type=float, default=None,
                         help="pass rule: gain at least this, no interval condition (default: the research rule)")
     args = parser.parse_args()
@@ -501,7 +574,7 @@ def main() -> None:
             sys.exit(f"No question has {args.predictions} predictions in every --ensemble batch (check --predictions).")
         dropped = len(set().union(*batch_preds)) - len(other)
         result = compare(questions, preds, other, len(names), None, args.base_k, args.min_gain,
-                         args.join_dates_within)
+                         args.join_dates_within, args.test)
         if not result["questions"]:
             sys.exit("No question has enough baseline predictions (check --base-k).")
         result["join_dates_within"] = args.join_dates_within
@@ -526,11 +599,12 @@ def main() -> None:
                     continue
                 research[row["id"]] = row
         result = compare(questions, preds, other, args.predictions, research, args.base_k, args.min_gain,
-                         args.join_dates_within)
+                         args.join_dates_within, args.test)
         result["join_dates_within"] = args.join_dates_within
         result["baseline"], result["compared"] = args.batches, args.compare
         OUT.mkdir(exist_ok=True)
-        suffix = f"-join{args.join_dates_within}" if args.join_dates_within else ""
+        suffix = (f"-join{args.join_dates_within}" if args.join_dates_within else "") + (
+            "-clustert" if args.test == "cluster-t" else "")
         path = OUT / f"compare-{'+'.join(args.batches)}-vs-{args.compare}{suffix}.json"
         path.write_text(json.dumps(result, indent=1))
         print(json.dumps(result, indent=1))

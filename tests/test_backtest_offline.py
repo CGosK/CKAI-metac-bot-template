@@ -617,7 +617,7 @@ def test_resume_refuses_changed_round3_settings():
 
     def ns(**kw):
         base = dict(forecaster="claude-cli/claude-opus-5-5", effort="high", prompt="template", evidence=False,
-                    reverse=False)
+                    reverse=False, data_block=None)
         base.update(kw)
         return argparse.Namespace(**base)
 

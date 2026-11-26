@@ -13,6 +13,15 @@ Usage:
     uv run python -m backtest.fetch [--commit SHA] [--freeze-from 2026-08-01]
     uv run python -m backtest.fetch --exclude-list backtest/data/questions.json   # held-out list
 
+With --datasets (PLAN-refine-round5.md), the output is ForecastBench's own data-series
+questions (fred, dbnomics) instead: one item per (series, freeze date), its
+resolution date picked by seeded hash among the resolved ones, placeholders
+filled, with the gold series id, ForecastBench's freeze value and a cluster id
+(source, freeze date, resolution date), written to
+backtest/data/datasets-<commit>.json (never overwritten).
+
+    uv run python -m backtest.fetch --datasets --commit 86b92ba06ed34d606d633bff3e99af54dd447d3a
+
 With --exclude-list, the output is a held-out list (PLAN-refine-round2.md):
 questions not in the given list and sharing no event with it (same group, or a
 resolution date within a day of one of its questions), written to
@@ -134,6 +143,83 @@ def select(
     return questions, dropped
 
 
+DATASET_SOURCES = ("fred", "dbnomics")
+DATASET_SEED = "round5-20261126"
+
+
+def _pick(options: list[str], key: str) -> str:
+    return min(options, key=lambda o: hashlib.sha256(f"{DATASET_SEED}:{key}:{o}".encode()).hexdigest())
+
+
+def select_datasets(
+    sets: list[tuple[str, dict, dict]], freeze_from: str, sources: tuple[str, ...] = DATASET_SOURCES
+) -> tuple[list[dict], dict[str, int]]:
+    """Dataset questions as binary items, one per (source, series, freeze date). `sets` is (date,
+    question set, resolution set) in date order; a question set's resolutions come from its own
+    resolution set. Sets sharing a freeze date keep the first."""
+    chosen: dict[tuple[str, str, str], dict] = {}
+    dropped = {"other_source": 0, "frozen_too_early": 0, "no_resolved_date": 0, "repeat_freeze": 0,
+               "no_freeze_value": 0}
+    for set_date, question_set, resolution_set in sets:
+        due = question_set["forecast_due_date"]
+        resolved: dict[tuple[str, str], dict[str, float]] = {}
+        for r in resolution_set["resolutions"]:
+            if (r["source"] in sources and isinstance(r["id"], str) and r.get("resolved") is True
+                    and r.get("resolved_to") in (0, 1, 0.0, 1.0) and r.get("direction") in (None, "")):
+                resolved.setdefault((r["source"], r["id"]), {})[r["resolution_date"]] = r["resolved_to"]
+        for q in question_set["questions"]:
+            if q["source"] not in sources or not isinstance(q["id"], str):
+                dropped["other_source"] += 1
+                continue
+            freeze = q["freeze_datetime"]
+            if freeze[:10] < freeze_from:
+                dropped["frozen_too_early"] += 1
+                continue
+            key = (q["source"], q["id"], freeze[:10])
+            if key in chosen:
+                dropped["repeat_freeze"] += 1
+                continue
+            dates = sorted(resolved.get((q["source"], q["id"]), {}))
+            if not dates:
+                dropped["no_resolved_date"] += 1
+                continue
+            value = q.get("freeze_datetime_value")
+            try:
+                freeze_value = float(value)
+            except (TypeError, ValueError):
+                dropped["no_freeze_value"] += 1
+                continue
+            res = _pick(dates, "|".join(key))
+            text = q["question"].replace("{resolution_date}", res).replace("{forecast_due_date}", due)
+            chosen[key] = {
+                "id": hashlib.sha256("|".join(key).encode()).hexdigest()[:16],
+                "source": q["source"],
+                "series_id": q["id"],
+                "set": set_date,
+                "group": f"{q['source']}:{q['id']}",
+                "cluster": f"{q['source']}:{freeze[:10]}:{res}",
+                "question": text.strip(),
+                "background": URL.sub("[link removed]", (q.get("background") or "").strip()),
+                "criteria": URL.sub("[link removed]", (q.get("resolution_criteria") or "").strip()),
+                "freeze_datetime": freeze,
+                "forecast_due_date": due,
+                "resolution_date": res,
+                "horizon_days": (_d(res) - _d(due)).days,
+                "freeze_value": freeze_value,
+                "freeze_value_explanation": (q.get("freeze_datetime_value_explanation") or "").strip(),
+                "crowd": None,
+                "outcome": int(resolved[(q["source"], q["id"])][res]),
+            }
+    items = sorted(chosen.values(), key=lambda x: hashlib.sha256(x["id"].encode()).hexdigest())
+    return items, dropped
+
+
+def _d(text: str):
+    from datetime import date
+
+    return date.fromisoformat(text[:10])
+
+
 def exclude_overlap(questions: list[dict], existing: list[dict], days: int = 1) -> tuple[list[dict], dict[str, int]]:
     """Drop questions in `existing` by id, by group, or by a resolution date
     within `days` of one of its questions, so no event is in both lists."""
@@ -162,12 +248,35 @@ def list_hash(questions: list[dict]) -> str:
     return hashlib.sha256(json.dumps(questions, sort_keys=True).encode()).hexdigest()
 
 
+def write_datasets(sets: list[tuple[str, dict, dict]], commit: str, freeze_from: str) -> None:
+    items, dropped = select_datasets(sets, freeze_from)
+    path = DATA_DIR / f"datasets-{commit[:12]}.json"
+    if path.exists():
+        sys.exit(f"{path} exists; item lists are never overwritten.")
+    DATA_DIR.mkdir(exist_ok=True)
+    out = {
+        "dataset": f"https://github.com/{REPO}", "dataset_commit": commit, "licence": "CC-BY-SA-4.0",
+        "freeze_from": freeze_from, "sets": [d for d, _, _ in sets], "sources": list(DATASET_SOURCES),
+        "selection": f"one item per (source, series, freeze date); resolution date by sha256 seed {DATASET_SEED}",
+        "dropped": dropped, "sha256": list_hash(items), "questions": items,
+    }
+    path.write_text(json.dumps(out, indent=1))
+    by_source: dict[str, int] = {}
+    for q in items:
+        by_source[q["source"]] = by_source.get(q["source"], 0) + 1
+    print(f"{len(items)} items {by_source}, {len({q['cluster'] for q in items})} clusters; dropped {dropped}")
+    print(f"dataset commit {commit}; list sha256 {out['sha256']}; wrote {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--commit", help="dataset commit SHA (default: current main)")
     parser.add_argument("--freeze-from", default=DEFAULT_FREEZE_FROM)
     parser.add_argument("--exclude-list", help="build a held-out list: leave out this list's questions and events")
+    parser.add_argument("--datasets", action="store_true", help="fred and dbnomics data-series items (round 5)")
     args = parser.parse_args()
+    if args.datasets and args.exclude_list:
+        parser.error("--datasets and --exclude-list don't combine")
 
     commit = args.commit or _get_json(f"https://api.github.com/repos/{REPO}/commits/main")["sha"]
     listing = _get_json(
@@ -189,6 +298,9 @@ def main() -> None:
         r = _get_json(f"{raw}/resolution_sets/{date}_resolution_set.json")
         sets.append((date, q, r))
 
+    if args.datasets:
+        write_datasets(sets, commit, args.freeze_from)
+        return
     questions, dropped = select(sets, args.freeze_from)
     excluded_from = None
     if args.exclude_list:

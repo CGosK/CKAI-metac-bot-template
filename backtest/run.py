@@ -47,6 +47,8 @@ ROUND2_PLAN = ROOT / "benchmarks" / "PLAN-refine-round2.md"
 ROUND2_AMEND = ROOT / "benchmarks" / "PLAN-refine-round2-amend1.md"
 ROUND3_PLAN = ROOT / "benchmarks" / "PLAN-refine-round3.md"
 ROUND4_PLAN = ROOT / "benchmarks" / "PLAN-refine-round4.md"
+ROUND5_PLAN = ROOT / "benchmarks" / "PLAN-refine-round5.md"
+DATA_BLOCKS = ("off", "fb", "ours")  # round 5: A0 no value, A1 ForecastBench's value, A2 our dated block
 # Forecasters the backtest may use, with their stated training cutoffs. Freezes start Aug 1, 2026.
 FORECASTERS = {
     "claude-cli/claude-opus-5-5": "Opus 5.5 training cutoff stated as June 2026 (Claude Code model information)",
@@ -158,6 +160,8 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         plan = ROUND3_PLAN
     if args.evidence or args.reverse:
         plan = ROUND4_PLAN
+    if args.data_block:
+        plan = ROUND5_PLAN
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout.strip()
     lines = {
         "command": " ".join(shlex.quote(a) for a in sys.argv),
@@ -184,6 +188,8 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         "reverse": "P(No) asked (round 4, X1)" if args.reverse else "off",
         "prompts_r4_sha256": _sha256(ROOT / "prompts_r4.py") if (args.evidence or args.reverse) else "unused",
         "freeze_from": meta["freeze_from"],
+        "data_block": args.data_block or "unused",
+        "data_research_sha256": _sha256(ROOT / "data_research.py") if args.data_block else "unused",
         "start": args.start,
         "limit": args.limit,
         "parallel": args.parallel,
@@ -261,7 +267,58 @@ def check_resume_settings(first_launch: str, args: argparse.Namespace) -> str | 
         return "--reverse differs from this batch's first launch."
     if (args.evidence or args.reverse) and lines.get("prompts_r4_sha256") != _sha256(ROOT / "prompts_r4.py"):
         return "prompts_r4.py changed since this batch's first launch."
+    if lines.get("data_block", "unused") != (args.data_block or "unused"):
+        return "--data-block differs from this batch's first launch."
+    if args.data_block and lines.get("data_research_sha256") != _sha256(ROOT / "data_research.py"):
+        return "data_research.py changed since this batch's first launch."
     return None
+
+
+def _number_forms(x: float) -> list[str]:
+    """Ways a value may be written in background text: as stored, without a trailing .0, with commas."""
+    forms = {repr(float(x)), f"{x:g}", f"{x:,}", f"{x:,.2f}", f"{x:.2f}"}
+    if float(x).is_integer():
+        forms |= {str(int(x)), f"{int(x):,}"}
+    return sorted((f for f in forms if len(f.replace(",", "").replace(".", "")) >= 2), key=len, reverse=True)
+
+
+def scrub_value(text: str, value: float) -> tuple[str, int]:
+    """Remove ForecastBench's freeze value from a text (round 5, all arms): returns the text and the count."""
+    import re
+
+    count = 0
+    for form in _number_forms(value):
+        text, n = re.subn(rf"(?<![\d.,]){re.escape(form)}(?!\d|\.\d)", "[value removed]", text)
+        count += n
+    return text, count
+
+
+def round5_item(q: dict) -> dict:
+    """A dataset item as the forecaster sees it: the freeze value removed from the background."""
+    background, removed = scrub_value(q["background"], q["freeze_value"])
+    return {**q, "background": background, "value_mentions_removed": removed}
+
+
+def data_block_text(q: dict, mode: str, http=None) -> dict:
+    """The research slot for a round-5 arm. off: nothing; fb: ForecastBench's single value;
+    ours: the dated block from data_research (rows strictly before T after the publication-lag rules)."""
+    if mode == "off":
+        return {"text": "", "arm": "A0"}
+    if mode == "fb":
+        what = q.get("freeze_value_explanation") or "The latest value"
+        return {"text": f"{what.rstrip('.')}: {q['freeze_value']:g} (as of {q['freeze_datetime'][:10]}).",
+                "arm": "A1"}
+    import data_research as dr
+
+    freeze = datetime.fromisoformat(q["freeze_datetime"])
+    try:
+        series = [dr.series_for(q["source"], q["series_id"], freeze, http)]
+    except dr.DataAuthError:
+        raise
+    except dr.DataUnavailable as exc:
+        return {"text": dr.format_block([], freeze), "arm": "A2", "error": dr.redact(str(exc))[:300]}
+    return {"text": dr.format_block(series, freeze), "arm": "A2", "rows": len(series[0].rows),
+            "last": series[0].rows[-1][0].isoformat()}
 
 
 def done_ks(path: Path) -> dict[str, set[int]]:
@@ -369,6 +426,7 @@ async def forecast_one(bot, q: dict, k: int, research: str = "") -> dict:
 async def run_batch(
     questions: list[dict], batch_dir: Path, predictions: int, parallel: int, research_mode: str = "none",
     sources: list[str] | None = None, lookback_days: int | None = None, reverse: bool = False,
+    data_block: str | None = None,
 ) -> None:
     """predictions=0 with a research mode fetches and stores research only."""
     import ckai_bot
@@ -430,6 +488,19 @@ async def run_batch(
             return joined_row(q["id"], stored)
 
         store = ResearchStore(batch_dir / "research.jsonl", fetcher=joined_fetch, serial=False)
+    if data_block:
+        import data_research as dr
+        from backtest.research import ResearchStore
+
+        stops = stops + (dr.DataAuthError, dr.DataLeak)
+        http = dr.PoliteHttp(cache=dr.CACHE_DIR)
+        fetch_lock = asyncio.Lock()  # one data request at a time
+
+        async def block_fetch(q: dict) -> dict:
+            async with fetch_lock:
+                return await asyncio.to_thread(data_block_text, q, data_block, http)
+
+        store = ResearchStore(batch_dir / "research.jsonl", fetcher=block_fetch, serial=False)
     slots = asyncio.Semaphore(parallel)
 
     async def do_question(q: dict) -> None:
@@ -535,6 +606,9 @@ def main() -> None:
     parser.add_argument("--evidence", action="store_true", help="add the round-4 evidence-and-window step")
     parser.add_argument("--reverse", action="store_true",
                         help="ask for P(No) (round 4, X1); predictions are P(No), combined later")
+    parser.add_argument("--data-block", choices=DATA_BLOCKS, default=None,
+                        help="round 5: off (A0), fb (A1, ForecastBench's value) or ours (A2, dated block); "
+                             "needs a --dataset of round-5 items")
     parser.add_argument("--research", default="none",
                         choices=["none", "asknews-historical", "wikipedia", "combined", "gdelt", "joined"])
     parser.add_argument("--sources", help="joined: batches whose stored research texts are joined, in order")
@@ -580,6 +654,12 @@ def main() -> None:
     if args.freeze_on:
         days = set(args.freeze_on.split(","))
         chosen = [q for q in chosen if q["freeze_datetime"][:10] in days]
+    if args.data_block:
+        if not all("series_id" in q and "freeze_value" in q for q in chosen):
+            parser.error("--data-block needs round-5 dataset items (backtest.fetch --datasets)")
+        if args.research != "none" or args.evidence or args.reverse:
+            parser.error("--data-block runs alone: no --research, --evidence or --reverse")
+        chosen = [round5_item(q) for q in chosen]
     if args.research == "joined" and not args.sources:
         parser.error("--research joined needs --sources")
     if args.research == "gdelt" and not args.lookback_days:
@@ -634,7 +714,7 @@ def main() -> None:
     try:
         asyncio.run(run_batch(chosen, batch_dir, args.predictions, args.parallel, args.research,
                               args.sources.split(",") if args.sources else None, args.lookback_days,
-                              args.reverse))
+                              args.reverse, args.data_block))
     finally:
         with open(batch_dir / "launch.txt", "a") as f:
             f.write(f"utc_end: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n\n")
