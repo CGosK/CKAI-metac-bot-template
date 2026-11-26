@@ -252,6 +252,7 @@ def test_data_block_ours_formats_rows_before_t(monkeypatch):
     assert "No data series was found" in missing["text"] and "error" in missing
 
 
+@pytest.mark.skipif(not run.ROUND5_PLAN.exists(), reason="needs the local round-5 plan (gitignored)")
 def test_resume_refuses_changed_data_block():
     ns = argparse.Namespace(forecaster="claude-cli/claude-opus-5-5", effort="high", prompt="template",
                             evidence=False, reverse=False, data_block="ours")
@@ -386,5 +387,6 @@ def test_x2_parse_pick_and_items():
     assert x2.parse_pick("Series: **fred:DGS10**", allowed) == "fred:DGS10"
     assert x2.parse_pick("SERIES: DGS10", allowed) == "fred:DGS10"  # bare id, unique
     assert x2.parse_pick("SERIES: fred:DGS10\n\nNote the series: Euro", allowed) == "fred:DGS10"  # line start only
-    names = x2.names()
-    assert len(set(names.values())) == len(names)  # no two series share a displayed name
+    if round5.DEFAULT_ITEMS.exists() and (score.RUNS / "r5-d1-ours" / "research.jsonl").exists():
+        names = x2.names()  # local items and runs only (gitignored)
+        assert len(set(names.values())) == len(names)  # no two series share a displayed name

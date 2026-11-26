@@ -747,6 +747,7 @@ def test_round3_election_rule_matches_explore_errors_without_running_it(tmp_path
     assert not rule({"question": "Will Bitcoin close above $100k?"})
 
 
+@pytest.mark.skipif(not score.QUESTIONS.exists(), reason="needs the local question list (gitignored)")
 def test_round3_batch_state_flags_a_running_batch(tmp_path, monkeypatch):
     from backtest import round3_verdict
 
