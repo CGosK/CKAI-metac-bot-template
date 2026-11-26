@@ -342,14 +342,21 @@ def test_f1_stops_on_a_transient_failure(monkeypatch):
         round5.f1_item(item(), None)
 
 
-def test_f1_dbnomics_later_is_explained_only_when_their_value_is_in_our_series():
-    base = {"source": "dbnomics", "series_id": "ECB_EXR_D.USD.EUR.SP00.A", "status": "later", "agree": False,
-            "later_than_fb": True, "fb_value_only_after_t": False, "fb_value_date": "2026-10-01"}
-    explained = {**base, "fb_value_in_our_rows": True}
-    unexplained = {**base, "fb_value_in_our_rows": False}
-    assert round5.f1_summary([explained])["passes"]
-    s = round5.f1_summary([unexplained])
-    assert not s["passes"] and s["later_unexplained"] == {"dbnomics:ECB/EXR": 1}
+def test_f1_dbnomics_later_is_explained_only_by_release_timing():
+    def row(series_id, our_date, freeze="2026-10-09"):
+        return {"source": "dbnomics", "series_id": series_id, "status": "later", "agree": False,
+                "later_than_fb": True, "fb_value_only_after_t": False, "fb_value_date": "2026-10-01",
+                "fb_value_in_our_rows": True, "fb_value_date_ambiguous": False, "our_date": our_date,
+                "freeze": freeze}
+
+    # YC is published the next business day: a Tuesday row is out on Wednesday, before a Friday freeze.
+    assert round5.f1_summary([row("ECB_YC_B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y", "2026-10-06")])["passes"]
+    # A Friday row is out on Monday: after a Monday 00:00 freeze, so unexplained.
+    late = round5.f1_summary([row("ECB_YC_B.U2.EUR.4F.G_N_A.SV_C_YM.SR_10Y", "2026-10-09", "2026-10-12")])
+    assert not late["passes"] and late["later_unexplained"]
+    # A dataset with no stated release timing is never explained.
+    assert not round5.f1_summary([row("ECB_CISS_D.IT.Z0Z.4F.EC.SS_CIN.IDX", "2026-09-24")])["passes"]
+    assert round5.published_on(date(2026, 10, 9), 1) == date(2026, 10, 12)
 
 
 def test_items_without_alfred_vintages_are_excluded():

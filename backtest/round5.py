@@ -134,6 +134,31 @@ def f1_item(item: dict, http) -> dict:
     return out
 
 
+# Publication timing of the DBnomics datasets with later rows in F1, in business days after the observation date
+# (ECB: euro reference rates are published at about 16:00 CET the same day; the euro area yield curves and EUR
+# short-term rate the next TARGET business day). A later row is explained only if, by this timing, it was
+# published before T's date; any other dataset's later rows stay unexplained.
+RELEASE_BUSINESS_DAYS = {"dbnomics:ECB/EXR": 0, "dbnomics:ECB/YC": 1, "dbnomics:ECB/EST": 1}
+
+
+def published_on(d: date, business_days: int) -> date:
+    """The day a value observed on d is published, n business days later (weekends skipped, holidays not)."""
+    out = d
+    for _ in range(business_days):
+        out += timedelta(days=1)
+        while out.weekday() >= 5:
+            out += timedelta(days=1)
+    return out
+
+
+def later_explained(r: dict, family: str) -> bool:
+    # Only our row's publication date decides a leak; where ForecastBench's value sits (even if ambiguous)
+    # doesn't (Chris, Nov 26).
+    if family not in RELEASE_BUSINESS_DAYS:
+        return False
+    return published_on(_d(r["our_date"]), RELEASE_BUSINESS_DAYS[family]) < _d(r["freeze"])
+
+
 def f1_summary(rows: list[dict]) -> dict:
     def part(sel: list[dict]) -> dict:
         ok = [r for r in sel if r["status"] != "unavailable"]
@@ -162,18 +187,18 @@ def f1_summary(rows: list[dict]) -> dict:
 
     later_by_family = _count(family(r) for r in rows if r.get("later_than_fb"))
     whole = part(rows)
-    # A DBnomics later row is explained when ForecastBench's value sits in our series at its date: our fetcher
-    # reproduces theirs and ours is newer (ForecastBench's pull was stale). Plan v1.1, added after F1 first ran.
+    # A DBnomics later row is explained when the provider's release timing puts our row's publication before T:
+    # it was public, and ForecastBench's own pull was stale. Plan v1.1, added after F1 first ran.
     ok = [r for r in rows if r["status"] != "unavailable"]
-    explained = [r for r in ok if r["status"] == "later" and r["source"] == "dbnomics" and r["fb_value_in_our_rows"]]
+    explained = [r for r in ok if r["status"] == "later" and r["source"] == "dbnomics" and later_explained(r, family(r))]
     consistent = sum(r["status"] in ("agree", "behind") for r in ok) + len(explained)
     share = round(consistent / len(ok), 4) if ok else None
     fred_later = by_source.get("fred", {}).get("later_than_fb", 0)
     unexplained = _count(family(r) for r in ok if r["status"] == "later" and r not in explained)
     return {"all": whole, "by_source": by_source, "later_by_family": later_by_family,
             "pass_rule": (f">= {F1_PASS:.0%} of fetched items agree or are behind (an older value, from the "
-                          "conservative cut), none unavailable, no FRED item later than ForecastBench's, and each "
-                          "DBnomics dataset with later rows explained by a stale ForecastBench pull (plan v1.1)"),
+                          "conservative cut) or are DBnomics later rows published before T by the provider's release "
+                          "timing (RELEASE_BUSINESS_DAYS), none unavailable, no FRED item later (plan v1.1)"),
             "consistent_share_of_fetched": share, "dbnomics_later_explained": len(explained),
             "later_unexplained": unexplained,
             "passes": bool(share is not None and share >= F1_PASS and fred_later == 0 and not unexplained

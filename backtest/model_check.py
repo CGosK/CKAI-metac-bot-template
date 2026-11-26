@@ -25,12 +25,12 @@ def check(batch: str) -> dict:
     model = first["forecaster"].split("/")[-1]
     dirs = [Path(ln.split(": ", 1)[1].strip()) for ln in launch.splitlines() if ln.startswith("call_logs: ")]
     tokens, other_tokens = Counter(), Counter()
-    files = no_result = 0
+    files = no_result = missing_usage = 0
     substituted = []
     for d in dirs:
         for f in sorted((d / "calls").glob("*.jsonl")):
             forecaster = f.name.endswith(f"-{model}.jsonl")
-            here, results = Counter(), 0
+            here, results, no_usage = Counter(), 0, 0
             for line in f.read_text(errors="replace").splitlines():
                 try:
                     row = json.loads(line)
@@ -38,18 +38,21 @@ def check(batch: str) -> dict:
                     continue
                 if isinstance(row, dict) and row.get("type") == "result":
                     results += 1
+                    no_usage += "model_usage_since_last_result" not in row
                     for m, u in (row.get("model_usage_since_last_result") or {}).items():
                         here[m] += u.get("outputTokens", 0)
             if forecaster:
                 files += 1
                 tokens.update(here)
                 no_result += results == 0
+                missing_usage += no_usage
                 if any(m != model and n for m, n in here.items()):
                     substituted.append(f.name)
             else:
                 other_tokens.update(here)
     return {"forecaster": model, "call_log_dirs": len(dirs), "forecaster_files": files,
             "forecaster_output_tokens": dict(tokens), "files_without_result": no_result,
+            "results_without_usage": missing_usage,
             "files_with_another_model": substituted, "other_calls_output_tokens": dict(other_tokens)}
 
 
@@ -63,7 +66,7 @@ def main() -> None:
     path.write_text(json.dumps(result, indent=1))
     for b, r in result.items():
         print(f"{b}: {r['forecaster_files']} forecaster calls, tokens {r['forecaster_output_tokens']}, "
-              f"no result {r['files_without_result']}, another model {len(r['files_with_another_model'])}")
+              f"no result {r['files_without_result']}, no usage {r['results_without_usage']}, another model {len(r['files_with_another_model'])}")
     print(f"wrote {path}")
 
 
