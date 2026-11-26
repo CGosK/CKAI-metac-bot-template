@@ -40,7 +40,14 @@ F1_PASS = 0.95
 
 
 def load_items(path: Path) -> dict:
-    return json.loads(path.read_text())
+    """The dataset items, less FRED series ALFRED has no vintages for (data_research.NO_VINTAGE_FRED)."""
+    data = json.loads(path.read_text())
+    data["questions"] = [q for q in data["questions"] if not excluded(q)]
+    return data
+
+
+def excluded(q: dict) -> bool:
+    return q.get("source") == "fred" and q.get("series_id") in dr.NO_VINTAGE_FRED
 
 
 def _d(text: str) -> date:
@@ -155,16 +162,22 @@ def f1_summary(rows: list[dict]) -> dict:
 
     later_by_family = _count(family(r) for r in rows if r.get("later_than_fb"))
     whole = part(rows)
-    share = whole["agree_or_behind_share_of_fetched"]
+    # A DBnomics later row is explained when ForecastBench's value sits in our series at its date: our fetcher
+    # reproduces theirs and ours is newer (ForecastBench's pull was stale). Plan v1.1, added after F1 first ran.
+    ok = [r for r in rows if r["status"] != "unavailable"]
+    explained = [r for r in ok if r["status"] == "later" and r["source"] == "dbnomics" and r["fb_value_in_our_rows"]]
+    consistent = sum(r["status"] in ("agree", "behind") for r in ok) + len(explained)
+    share = round(consistent / len(ok), 4) if ok else None
     fred_later = by_source.get("fred", {}).get("later_than_fb", 0)
-    db_later = {k: v for k, v in later_by_family.items() if k.startswith("dbnomics:")}
+    unexplained = _count(family(r) for r in ok if r["status"] == "later" and r not in explained)
     return {"all": whole, "by_source": by_source, "later_by_family": later_by_family,
             "pass_rule": (f">= {F1_PASS:.0%} of fetched items agree or are behind (an older value, from the "
                           "conservative cut), none unavailable, no FRED item later than ForecastBench's, and each "
                           "DBnomics dataset with later rows explained by a stale ForecastBench pull (plan v1.1)"),
-            "passes_automatic_part": bool(share is not None and share >= F1_PASS and fred_later == 0
-                                          and whole["unavailable"] == 0),
-            "dbnomics_later_to_review": db_later}
+            "consistent_share_of_fetched": share, "dbnomics_later_explained": len(explained),
+            "later_unexplained": unexplained,
+            "passes": bool(share is not None and share >= F1_PASS and fred_later == 0 and not unexplained
+                           and whole["unavailable"] == 0)}
 
 
 def _count(values) -> dict:

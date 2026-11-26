@@ -176,7 +176,7 @@ def test_f1_agree_disagree_and_later(monkeypatch):
     off = round5.f1_item(item(), FakeHttp(fred_handler([("2026-08-05", "5.0")])))
     assert off["status"] == "undetermined" and off["fb_value_date"] is None
     summary = round5.f1_summary([agree, later, off])
-    assert summary["all"]["agree"] == 1 and summary["all"]["later_than_fb"] == 1 and not summary["passes_automatic_part"]
+    assert summary["all"]["agree"] == 1 and summary["all"]["later_than_fb"] == 1 and not summary["passes"]
 
 
 def test_f1_precision_follows_reference():
@@ -326,7 +326,7 @@ def test_f1_agreeing_repeated_value_is_not_later_and_older_value_is_behind(monke
     r = round5.f1_item(item(), FakeHttp(fred_handler(held)))
     assert r["status"] == "agree" and not r.get("later_than_fb") and not r["fb_value_date_ambiguous"]
     summary = round5.f1_summary([r])
-    assert summary["all"]["later_than_fb"] == 0 and summary["passes_automatic_part"]
+    assert summary["all"]["later_than_fb"] == 0 and summary["passes"]
     # Our cut ends at an older value; ForecastBench's newer one exists in the reference rows: behind, not later.
     monkeypatch.setattr(round5, "full_rows", lambda it, http: [(date(2026, 8, 3), 4.1), (date(2026, 8, 5), 4.2)])
     b = round5.f1_item(item(), FakeHttp(fred_handler([("2026-08-03", "4.1")])))
@@ -340,3 +340,18 @@ def test_f1_stops_on_a_transient_failure(monkeypatch):
     monkeypatch.setattr(dr, "series_for", boom)
     with pytest.raises(dr.DataTransient):
         round5.f1_item(item(), None)
+
+
+def test_f1_dbnomics_later_is_explained_only_when_their_value_is_in_our_series():
+    base = {"source": "dbnomics", "series_id": "ECB_EXR_D.USD.EUR.SP00.A", "status": "later", "agree": False,
+            "later_than_fb": True, "fb_value_only_after_t": False, "fb_value_date": "2026-10-01"}
+    explained = {**base, "fb_value_in_our_rows": True}
+    unexplained = {**base, "fb_value_in_our_rows": False}
+    assert round5.f1_summary([explained])["passes"]
+    s = round5.f1_summary([unexplained])
+    assert not s["passes"] and s["later_unexplained"] == {"dbnomics:ECB/EXR": 1}
+
+
+def test_items_without_alfred_vintages_are_excluded():
+    assert round5.excluded({"source": "fred", "series_id": "SP500"})
+    assert not round5.excluded({"source": "fred", "series_id": "DGS10"})

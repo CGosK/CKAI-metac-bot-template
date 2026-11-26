@@ -697,7 +697,9 @@ def main() -> None:
             parser.error("--data-block needs round-5 dataset items (backtest.fetch --datasets)")
         if args.research != "none" or args.evidence or args.reverse:
             parser.error("--data-block runs alone: no --research, --evidence or --reverse")
-        chosen = [round5_item(q) for q in chosen]
+        from backtest.round5 import excluded
+
+        chosen = [round5_item(q) for q in chosen if not excluded(q)]  # no as-published values (round5.excluded)
     if args.research == "joined" and not args.sources:
         parser.error("--research joined needs --sources")
     if args.research == "gdelt" and not args.lookback_days:

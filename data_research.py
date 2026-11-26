@@ -62,7 +62,9 @@ FRED_SERIES = "https://api.stlouisfed.org/fred/series"
 DBNOMICS_LAG_DAYS = {"daily": 2, "weekly": 14, "monthly": 60, "quarterly": 120, "annual": 400}
 # Datasets published later than their frequency suggests (code review, Nov 26): the larger lag applies.
 # ECB CISS is a daily index released weekly.
-DBNOMICS_DATASET_LAG_DAYS = {("ECB", "CISS"): 14}
+DBNOMICS_DATASET_LAG_DAYS = {("ECB", "CISS"): 14, ("ECB", "ILM"): 14}  # ILM: release timing unknown, so safe
+# FRED series ALFRED has no vintages for (licensed index data): no as-published values, so excluded from round 5.
+NO_VINTAGE_FRED = frozenset({"SP500", "DJIA"})
 CACHE_DIR = Path(os.environ.get("DATA_RESEARCH_CACHE", Path.home() / ".cache" / "ckai-bot-data"))
 _KEY_PARAM = re.compile(r"(api_key=)[^&\s]+")
 TREASURY_TENORS = ("1 Mo", "1.5 Month", "2 Mo", "3 Mo", "4 Mo", "6 Mo", "1 Yr", "2 Yr", "3 Yr", "5 Yr",
