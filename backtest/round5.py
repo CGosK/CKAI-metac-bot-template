@@ -60,8 +60,9 @@ def same_value(a: float, b: float, places: int) -> bool:
 
 
 def full_rows(item: dict, http) -> list[tuple[date, float]]:
-    """Every row the source gives for the item, not cut at T: FRED as published the day before T (ALFRED),
-    DBnomics as served today."""
+    """Every row the source gives for the item, not cut at T, to find where ForecastBench's value sits: FRED as
+    published on T-1 by UTC date (looser than the fetcher's vintage on purpose: ForecastBench pulled at T, so
+    it may hold an evening posting), DBnomics as served today."""
     if item["source"] == "fred":
         return dr.fred_vintage_rows(item["series_id"], _d(item["freeze_datetime"]) - timedelta(days=1), http)
     return dr.dbnomics_rows(dr.dbnomics_doc(*dr.dbnomics_id(item["series_id"]), http))
@@ -88,8 +89,8 @@ def f1_item(item: dict, http) -> dict:
     try:
         s = dr.series_for(item["source"], item["series_id"], t, http)
         rows = full_rows(item, http)
-    except dr.DataAuthError:
-        raise
+    except (dr.DataAuthError, dr.DataTransient):
+        raise  # a network failure stops the check rather than counting as "unavailable"
     except dr.DataUnavailable as exc:
         return {**out, "status": "unavailable", "error": dr.redact(str(exc))[:300]}
     places = decimals(item["freeze_value"])
@@ -111,15 +112,18 @@ def f1_item(item: dict, http) -> dict:
                fb_value_date=fb_date.isoformat() if fb_date else None, fb_value_date_ambiguous=ambiguous,
                fb_value_only_after_t=bool(matches) and not before_t,
                fb_value_in_our_rows=any(same_value(v, item["freeze_value"], places) for _, v in s.rows))
-    if fb_date is not None:
+    if fb_date is not None and not out["agree"]:
+        # Agreeing items hold ForecastBench's value in their last row, so they are neither later nor behind.
         out["our_minus_fb_days"] = (last_d - fb_date).days
         out["later_than_fb"] = last_d > fb_date
+        out["behind_fb"] = last_d < fb_date  # an older value: our conservative cut, not a leak
+    out["fb_value_date_ambiguous"] = ambiguous and not out["agree"]
     if out["agree"]:
         out["status"] = "agree"  # our last row holds ForecastBench's value, so it is not later than theirs
     elif fb_date is None:
         out["status"] = "undetermined"  # value not found before T: the leak check can't run
     else:
-        out["status"] = "later" if out["later_than_fb"] else "disagree"
+        out["status"] = "later" if out["later_than_fb"] else "behind" if out["behind_fb"] else "disagree"
     return out
 
 
@@ -133,6 +137,9 @@ def f1_summary(rows: list[dict]) -> dict:
             "agree_share_of_fetched": round(sum(r["agree"] for r in ok) / len(ok), 4) if ok else None,
             "later_than_fb": sum(bool(r.get("later_than_fb")) for r in ok),
             "undetermined": sum(r["status"] == "undetermined" for r in ok),
+            "behind_fb": sum(r["status"] == "behind" for r in ok),
+            "agree_or_behind_share_of_fetched": (round(sum(r["status"] in ("agree", "behind") for r in ok) / len(ok), 4)
+                                                 if ok else None),
             "fb_date_ambiguous": sum(bool(r.get("fb_value_date_ambiguous")) for r in ok),
             "fb_value_only_after_t": sum(r["fb_value_only_after_t"] for r in ok),
             "fb_value_not_found": sum(r["fb_value_date"] is None and not r["fb_value_only_after_t"] for r in ok),
@@ -148,11 +155,16 @@ def f1_summary(rows: list[dict]) -> dict:
 
     later_by_family = _count(family(r) for r in rows if r.get("later_than_fb"))
     whole = part(rows)
-    share = whole["agree_share_of_fetched"]
+    share = whole["agree_or_behind_share_of_fetched"]
+    fred_later = by_source.get("fred", {}).get("later_than_fb", 0)
+    db_later = {k: v for k, v in later_by_family.items() if k.startswith("dbnomics:")}
     return {"all": whole, "by_source": by_source, "later_by_family": later_by_family,
-            "pass_rule": f">= {F1_PASS:.0%} of items agree to the stated precision and none later than ForecastBench's",
-            "passes": bool(share is not None and share >= F1_PASS and whole["later_than_fb"] == 0
-                           and whole["unavailable"] == 0)}
+            "pass_rule": (f">= {F1_PASS:.0%} of fetched items agree or are behind (an older value, from the "
+                          "conservative cut), none unavailable, no FRED item later than ForecastBench's, and each "
+                          "DBnomics dataset with later rows explained by a stale ForecastBench pull (plan v1.1)"),
+            "passes_automatic_part": bool(share is not None and share >= F1_PASS and fred_later == 0
+                                          and whole["unavailable"] == 0),
+            "dbnomics_later_to_review": db_later}
 
 
 def _count(values) -> dict:
@@ -233,6 +245,8 @@ def f2(items: list[dict], http, rates: dict) -> dict:
         t = datetime.fromisoformat(item["freeze_datetime"])
         try:
             s = dr.series_for(item["source"], item["series_id"], t, http)
+        except dr.DataTransient:
+            raise
         except dr.DataUnavailable:
             continue
         weather = item["series_id"].startswith("meteofrance_")

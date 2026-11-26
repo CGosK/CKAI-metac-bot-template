@@ -139,6 +139,8 @@ class PoliteHttp:
             raise DataTransient(redact(f"{url}: {exc}")) from None
         finally:
             self._last = time.monotonic()
+        if body.lstrip()[:1] == b"<":  # an HTML error or maintenance page served with 200: not data, not cached
+            raise DataTransient(redact(f"{url}: HTML page instead of data"))
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)

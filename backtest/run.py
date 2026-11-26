@@ -298,6 +298,8 @@ def check_resume_settings(first_launch: str, args: argparse.Namespace) -> str | 
         return "--data-block differs from this batch's first launch."
     if args.data_block and lines.get("data_research_sha256") != _sha256(ROOT / "data_research.py"):
         return "data_research.py changed since this batch's first launch."
+    if args.data_block and not ROUND5_PLAN.exists():
+        return "the round-5 plan (benchmarks/PLAN-refine-round5.md) is missing; it is hashed into every launch."
     if args.data_block and lines.get("plan_sha256") != _sha256(ROUND5_PLAN):
         return "the round-5 plan changed since this batch's first launch."
     return None

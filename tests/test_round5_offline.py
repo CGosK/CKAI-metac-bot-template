@@ -176,7 +176,7 @@ def test_f1_agree_disagree_and_later(monkeypatch):
     off = round5.f1_item(item(), FakeHttp(fred_handler([("2026-08-05", "5.0")])))
     assert off["status"] == "undetermined" and off["fb_value_date"] is None
     summary = round5.f1_summary([agree, later, off])
-    assert summary["all"]["agree"] == 1 and summary["all"]["later_than_fb"] == 1 and not summary["passes"]
+    assert summary["all"]["agree"] == 1 and summary["all"]["later_than_fb"] == 1 and not summary["passes_automatic_part"]
 
 
 def test_f1_precision_follows_reference():
@@ -318,3 +318,25 @@ def test_scrub_trailing_zeros_unicode_minus_and_not_dates_or_durations():
     assert run.scrub_value("fell to \u22120.5 today", -0.5)[1] == 1
     text, n = run.scrub_value("on 2026-09-20 the index, over the past 20 years, read 20.", 20.0)
     assert n == 1 and "2026-09-20" in text and "20 years" in text
+
+
+def test_f1_agreeing_repeated_value_is_not_later_and_older_value_is_behind(monkeypatch):
+    monkeypatch.setenv("FRED_API_KEY", FAKE_KEY)
+    held = [("2026-07-30", "4.2"), ("2026-07-31", "4.2"), ("2026-08-03", "4.2"), ("2026-08-04", "4.2")]
+    r = round5.f1_item(item(), FakeHttp(fred_handler(held)))
+    assert r["status"] == "agree" and not r.get("later_than_fb") and not r["fb_value_date_ambiguous"]
+    summary = round5.f1_summary([r])
+    assert summary["all"]["later_than_fb"] == 0 and summary["passes_automatic_part"]
+    # Our cut ends at an older value; ForecastBench's newer one exists in the reference rows: behind, not later.
+    monkeypatch.setattr(round5, "full_rows", lambda it, http: [(date(2026, 8, 3), 4.1), (date(2026, 8, 5), 4.2)])
+    b = round5.f1_item(item(), FakeHttp(fred_handler([("2026-08-03", "4.1")])))
+    assert b["status"] == "behind" and b["our_minus_fb_days"] == -2
+
+
+def test_f1_stops_on_a_transient_failure(monkeypatch):
+    def boom(*a, **k):
+        raise dr.DataTransient("timeout")
+
+    monkeypatch.setattr(dr, "series_for", boom)
+    with pytest.raises(dr.DataTransient):
+        round5.f1_item(item(), None)
