@@ -49,6 +49,7 @@ ROUND3_PLAN = ROOT / "benchmarks" / "PLAN-refine-round3.md"
 ROUND4_PLAN = ROOT / "benchmarks" / "PLAN-refine-round4.md"
 ROUND5_PLAN = ROOT / "benchmarks" / "PLAN-refine-round5.md"
 ROUND6_PLAN = ROOT / "benchmarks" / "PLAN-refine-round6-levels.md"
+ROUND7_PLAN = ROOT / "benchmarks" / "PLAN-refine-round7-numeric.md"
 DATA_BLOCK_PLAN = ROUND5_PLAN  # the plan hashed into --data-block launches; round-6 item files switch it (main)
 DATA_BLOCKS = ("off", "fb", "ours")  # round 5: A0 no value, A1 ForecastBench's value, A2 our dated block
 # Forecasters the backtest may use, with their stated training cutoffs. Freezes start Aug 1, 2026.
@@ -136,16 +137,36 @@ def install_date_stub() -> None:
 
 
 def to_question(q: dict):
-    from forecasting_tools import BinaryQuestion
+    """A stored item as the bot's question object: binary unless the item says numeric or multiple_choice
+    (round 7)."""
+    from forecasting_tools import BinaryQuestion, MultipleChoiceQuestion, NumericQuestion
 
-    return BinaryQuestion(
-        question_text=q["question"],
-        background_info=q["background"],
-        resolution_criteria=q["criteria"],
-        fine_print="",
-        page_url=f"backtest:{q['id']}",
-        tournament_slugs=["backtest"],
-    )
+    common = dict(question_text=q["question"], background_info=q["background"], resolution_criteria=q["criteria"],
+                  fine_print="", page_url=f"backtest:{q['id']}", tournament_slugs=["backtest"])
+    kind = q.get("question_type", "binary")
+    if kind == "numeric":
+        return NumericQuestion(**common, upper_bound=q["upper_bound"], lower_bound=q["lower_bound"],
+                               open_upper_bound=True, open_lower_bound=True, zero_point=None, cdf_size=201,
+                               unit_of_measure=q.get("units") or None)
+    if kind == "multiple_choice":
+        return MultipleChoiceQuestion(**common, options=q["options"])
+    return BinaryQuestion(**common)
+
+
+def prediction_fields(kind: str, value) -> dict:
+    """What a prediction row stores: binary the probability; numeric the declared percentiles, the final CDF the
+    library would submit and the declared median as `prediction`; multiple choice the option probabilities."""
+    if kind == "numeric":
+        from backtest.scoring_numeric import live_cdf, median
+
+        declared = [[p.percentile, p.value] for p in value.declared_percentiles]
+        cdf = [p.percentile for p in value.get_cdf()]
+        return {"prediction": median(declared), "percentiles": declared, "cdf": cdf,
+                "cdf_submitted": live_cdf(cdf, value.lower_bound, value.upper_bound)}
+    if kind == "multiple_choice":
+        probs = {o.option_name: o.probability for o in value.predicted_options}
+        return {"prediction": max(probs.values()), "options": probs}
+    return {"prediction": value}
 
 
 def configure_env(effort: str = DEFAULT_EFFORT, prompt: str = "template", evidence: bool = False) -> None:
@@ -239,6 +260,8 @@ def write_launch(batch_dir: Path, meta: dict, args: argparse.Namespace) -> None:
         lines["wiki_py_sha256"] = _sha256(Path(wiki.__file__))
     if args.freeze_on:
         lines["freeze_on"] = args.freeze_on
+    if getattr(args, "question_type", None):
+        lines["question_type"] = args.question_type
     if args.research == "gdelt":
         import gdelt_research
 
@@ -446,15 +469,18 @@ async def forecast_one(bot, q: dict, k: int, research: str = "") -> dict:
     _freeze_date.set(freeze)
     forecaster = bot._pick_forecaster()
     token = ckai_bot._current_forecaster.set(forecaster)
+    kind = q.get("question_type", "binary")
+    run_forecast = {"numeric": bot._run_forecast_on_numeric,
+                    "multiple_choice": bot._run_forecast_on_multiple_choice}.get(kind, bot._run_forecast_on_binary)
     try:
-        prediction = await bot._run_forecast_on_binary(to_question(q), research)
+        prediction = await run_forecast(to_question(q), research)
     finally:
         ckai_bot._current_forecaster.reset(token)
     return {
         "id": q["id"],
         "k": k,
         "model": forecaster.model,
-        "prediction": prediction.prediction_value,
+        **prediction_fields(kind, prediction.prediction_value),
         "reasoning": prediction.reasoning,
         "utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -651,6 +677,8 @@ def main() -> None:
     parser.add_argument("--sources", help="joined: batches whose stored research texts are joined, in order")
     parser.add_argument("--lookback-days", type=int, help="gdelt: look-back before the freeze, in days")
     parser.add_argument("--freeze-on", help="only questions frozen on these dates (comma-separated YYYY-MM-DD)")
+    parser.add_argument("--question-type", choices=["binary", "numeric", "multiple_choice"],
+                        help="only items of this type (round 7: numeric arms, MC smoke test)")
     parser.add_argument("--sample", type=int, default=None, help="a seeded random sample of this many questions")
     parser.add_argument("--pilot", type=int, default=None, help="round 5 P0: this many items spread across clusters")
     parser.add_argument("--exclude-pilot", type=int, default=None, metavar="N",
@@ -688,15 +716,17 @@ def main() -> None:
         parser.error("--batch is required")
 
     meta = json.loads(QUESTIONS.read_text())
-    if meta.get("round") == 6:  # round-6 level items (backtest.round6) are hashed against their own plan
+    if meta.get("round") in (6, 7):  # round-6/7 self-made items are hashed against their own plan
         global DATA_BLOCK_PLAN
-        DATA_BLOCK_PLAN = ROUND6_PLAN
+        DATA_BLOCK_PLAN = ROUND6_PLAN if meta["round"] == 6 else ROUND7_PLAN
     questions = meta["questions"]
     end = None if args.limit is None else args.start + args.limit
     chosen = questions[args.start : end]
     if args.freeze_on:
         days = set(args.freeze_on.split(","))
         chosen = [q for q in chosen if q["freeze_datetime"][:10] in days]
+    if args.question_type:
+        chosen = [q for q in chosen if q.get("question_type", "binary") == args.question_type]
     if args.data_block:
         if not all("series_id" in q and "freeze_value" in q for q in chosen):
             parser.error("--data-block needs round-5 dataset items (backtest.fetch --datasets)")

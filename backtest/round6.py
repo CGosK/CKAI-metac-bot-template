@@ -290,6 +290,18 @@ def make_question(c: dict, t_date: date, h: int, role: str, rank: int, backgroun
 
 
 def resolve_one(q: dict, http, fresh=None, dbn_cache: dict | None = None) -> dict:
+    """observe() plus the outcome: strictly above the stored threshold."""
+    r = observe(q, http, fresh, dbn_cache)
+    if "obs_value" in r:
+        r = {"outcome": int(r["obs_value"] > q["threshold"]), **r}
+    else:
+        r = {"outcome": None, **r}
+    return r
+
+
+def observe(q: dict, http, fresh=None, dbn_cache: dict | None = None) -> dict:
+    """The value that resolves q: the latest observation on or before its due date (FRED: the ALFRED vintage 7/14
+    days after; DBnomics: fetched now, uncached), or a reason it can't (stale: more than STALE_DAYS early)."""
     due = date.fromisoformat(q["resolution_date"])
     if q["source"] == "fred":
         vintage = due + timedelta(days=VINTAGE_DAYS[q["frequency"]])
@@ -306,12 +318,11 @@ def resolve_one(q: dict, http, fresh=None, dbn_cache: dict | None = None) -> dic
     used = [(d, v) for d, v in rows if d <= due]
     stored = [[d.isoformat(), v] for d, v in rows if due - timedelta(days=21) <= d <= due + timedelta(days=7)]
     if not used:
-        return {"outcome": None, "why": "no observation on or before the due date", "how": how, "rows": stored}
+        return {"why": "no observation on or before the due date", "how": how, "rows": stored}
     d, v = used[-1]
     if d < due - timedelta(days=STALE_DAYS):
-        return {"outcome": None, "why": f"stale: last observation {d.isoformat()}", "how": how, "rows": stored}
-    return {"outcome": int(v > q["threshold"]), "obs_date": d.isoformat(), "obs_value": v, "how": how,
-            "rows": stored}
+        return {"why": f"stale: last observation {d.isoformat()}", "how": how, "rows": stored}
+    return {"obs_date": d.isoformat(), "obs_value": v, "how": how, "rows": stored}
 
 
 def resolve(http) -> dict:
