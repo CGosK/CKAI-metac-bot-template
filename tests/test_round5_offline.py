@@ -200,6 +200,7 @@ def test_x3_question_threshold_and_resolution():
     rows = [(date(2025, 1, 1) + timedelta(days=i), float(i % 7)) for i in range(500)]
     q = round5.x3_question(item(), rows, 1, "Series")
     assert q["self_made"] and q["threshold"] > rows[-1][1] and q["outcome"] is None
+    assert q["freeze_value"] == item()["freeze_value"]  # run.py --data-block needs it to scrub A0's background
     assert round5.x3_resolve(q, [(date(2026, 9, 14), q["threshold"] + 1)]) == 1
     assert round5.x3_resolve(q, [(date(2026, 9, 14), q["threshold"])]) == 0
     assert round5.x3_resolve(q, [(date(2026, 9, 16), 99.0)]) is None
@@ -362,3 +363,28 @@ def test_f1_dbnomics_later_is_explained_only_by_release_timing():
 def test_items_without_alfred_vintages_are_excluded():
     assert round5.excluded({"source": "fred", "series_id": "SP500"})
     assert not round5.excluded({"source": "fred", "series_id": "DGS10"})
+
+
+# ---------------------------------------------------------------- X2
+
+
+def test_x2_parse_pick_and_items():
+    from backtest import round5_x2 as x2
+
+    allowed = {"fred:DGS10", "dbnomics:ECB_EXR_D.USD.EUR.SP00.A"}
+    assert x2.parse_pick("reasoning\nSERIES: fred:DGS10", allowed) == "fred:DGS10"
+    assert x2.parse_pick("SERIES: `fred:DGS10`.", allowed) == "fred:DGS10"
+    assert x2.parse_pick("SERIES: none", allowed) == "none"
+    assert x2.parse_pick("SERIES: fred:DGS2", allowed) == "invalid"  # not in the list it was shown
+    assert x2.parse_pick("no answer line", allowed) == "invalid"
+    assert x2.parse_pick("SERIES: fred:DGS2\nSERIES: fred:DGS10", allowed) == "fred:DGS10"  # last line wins
+    assert "fred:DGS10" not in x2.allowlist_text({"fred:DGS10": "10y", "fred:DGS2": "2y"}, "fred:DGS10")
+    assert x2.words("Degree Celsius - LYON-ST EXUPERY - Daily") == {"lyon", "exupery"}
+    assert "desirade" in x2.words("La Désirade")  # accents stripped, not split
+    assert {"poitiers", "biard"} <= x2.words("Poitiers–Biard Airport")  # an en dash still splits
+    assert x2.parse_pick("**SERIES:** fred:DGS10", allowed) == "fred:DGS10"
+    assert x2.parse_pick("Series: **fred:DGS10**", allowed) == "fred:DGS10"
+    assert x2.parse_pick("SERIES: DGS10", allowed) == "fred:DGS10"  # bare id, unique
+    assert x2.parse_pick("SERIES: fred:DGS10\n\nNote the series: Euro", allowed) == "fred:DGS10"  # line start only
+    names = x2.names()
+    assert len(set(names.values())) == len(names)  # no two series share a displayed name

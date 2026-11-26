@@ -22,7 +22,7 @@ from backtest import score
 def check(batch: str) -> dict:
     launch = (score.RUNS / batch / "launch.txt").read_text()
     first = dict(ln.split(": ", 1) for ln in launch.split("\n\n")[0].splitlines() if ": " in ln)
-    model = first["forecaster"].split("/")[-1]
+    model = (first.get("forecaster") or first["helper"].split(" ")[0]).split("/")[-1]  # X2 records a helper
     dirs = [Path(ln.split(": ", 1)[1].strip()) for ln in launch.splitlines() if ln.startswith("call_logs: ")]
     tokens, other_tokens = Counter(), Counter()
     files = no_result = missing_usage = 0

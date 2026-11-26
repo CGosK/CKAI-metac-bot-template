@@ -348,7 +348,8 @@ def x3_question(item: dict, rows_before_t: list[tuple[date, float]], multiple: i
     return {"id": qid, "source": item["source"], "series_id": item["series_id"], "group": item["group"],
             "cluster": item["cluster"], "self_made": True, "multiple": multiple, "threshold": threshold,
             "question": f"Will {name} be above {threshold:g} on {due}?",
-            "background": item["background"],
+            "background": item["background"], "freeze_value": item["freeze_value"],
+            "freeze_value_explanation": item.get("freeze_value_explanation"),
             "criteria": (f"Resolves Yes if the value of {name} for {due} (the latest observation dated on or "
                          f"before {due}) is strictly above {threshold:g}. Self-made test question."),
             "freeze_datetime": item["freeze_datetime"], "resolution_date": due, "crowd": None, "outcome": None}
@@ -368,7 +369,7 @@ def x3_pick(items: list[dict], n: int) -> list[tuple[dict, int]]:
     return out
 
 
-def x3(items: list[dict], http, n: int) -> dict:
+def x3(items: list[dict], http, n: int, source: dict | None = None) -> dict:
     questions = []
     for item, m in x3_pick(items, n):
         t = datetime.fromisoformat(item["freeze_datetime"])
@@ -381,8 +382,12 @@ def x3(items: list[dict], http, n: int) -> dict:
         q["outcome"] = x3_resolve(q, now)
         if q["outcome"] is not None:
             questions.append(q)
-    return {"self_made": True, "multiples": list(X3_MULTIPLES), "sha256": fetch.list_hash(questions),
-            "questions": questions}
+    source = source or {}
+    return {"self_made": True, "multiples": list(X3_MULTIPLES),
+            # the source items' provenance, as run.py records it in launch.txt
+            "dataset_commit": source.get("dataset_commit"), "freeze_from": source.get("freeze_from"),
+            "source_items_sha256": source.get("sha256"),
+            "sha256": fetch.list_hash(questions), "questions": questions}
 
 
 # ---------------------------------------------------------------- main
@@ -422,10 +427,12 @@ def main() -> None:
             rates = base_rates(meta["dataset_commit"], "2026-08-01")
             result = {"base_rates": rates, **f2(items, http, rates)}
         else:
-            path = DATA / f"x3-levels-{Path(args.items).stem}.json"
+            # v3: items carry freeze_value (run.py's A0 arm scrubs it as in D1) and the file carries the source
+            # items' provenance, which run.py's launch.txt needs. v1 and v2 lacked these and were never run.
+            path = DATA / f"x3-levels-v3-{Path(args.items).stem}.json"
             if path.exists():
                 sys.exit(f"{path} exists; item lists are never overwritten.")
-            result = x3(items, http, args.n)
+            result = x3(items, http, args.n, meta)
             path.write_text(json.dumps(result, indent=1, default=str))
             print(f"wrote {len(result['questions'])} self-made questions to {path}")
     except dr.DataAuthError as exc:
