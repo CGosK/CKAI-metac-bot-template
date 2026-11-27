@@ -251,12 +251,20 @@ def test_read_declared_percentiles():
     assert got[10] == ng.Reading(1.0, "million", False)
     assert got[20] == ng.Reading(1_500_000.0, None, False)
     assert got[40] == ng.Reading(2.0, "bn", False)
-    assert got[60] == ng.Reading(2.4, "m", False)
+    assert got[60] == ng.Reading(2.4, "M", False)  # the letter kept as written
     assert got[80] == ng.Reading(30.0, None, True)
     assert got[90] == ng.Reading(-4.5, "thousand", False)
     assert got[2] == ng.Reading(1_200_000.0, None, False)  # scientific notation read whole
     assert got[3] == ng.Reading(2.4, None, False)  # "Mt" is a unit, not a magnitude
     assert 4 not in got and 5 not in got  # ranges are skipped
+
+
+def test_read_declared_percentiles_line_ends():
+    got = ng.read_declared_percentiles("Percentile 10: 5.\nPercentile 20: 80\nMillion-dollar losses\n"
+                                       "Percentile 40: 90\n\n- 3 reasons follow")
+    assert got[10] == ng.Reading(5.0, None, False)  # a full stop ending the sentence
+    assert got[20] == ng.Reading(80.0, None, False)  # a word on the next line isn't a magnitude
+    assert got[40] == ng.Reading(90.0, None, False)  # a list on the next line isn't a range
 
 
 @pytest.mark.parametrize(("unit", "magnitude"), [
@@ -356,6 +364,44 @@ LOG = dict(upper_bound=1e7, lower_bound=1, open_lower_bound=True, zero_point=0)
 )
 def test_g2_more_cases_not_flagged(question, parsed, text):
     assert ng.units_mismatch(pct(parsed), text, question) is None
+
+
+LOG_Q = dict(lower_bound=1, open_lower_bound=True, zero_point=0)
+
+
+@pytest.mark.parametrize(
+    ("question", "parsed", "written"),
+    [
+        # log-scaled questions where the forecaster uses an equivalent unit the reader doesn't know
+        (numeric_q(upper_bound=1e6, unit_of_measure="MW", **LOG_Q), [12500, 13000, 14000, 15000, 16000, 17000],
+         [f"{v} GW" for v in (12.5, 13, 14, 15, 16, 17)]),
+        (numeric_q(upper_bound=1e4, unit_of_measure="USD", **LOG_Q), [0.5, 0.55, 0.6, 0.65, 0.7, 0.75],
+         [f"{v} cents" for v in (50, 55, 60, 65, 70, 75)]),
+        (numeric_q(upper_bound=1e5, unit_of_measure="kilotonnes", **LOG_Q), [300, 320, 340, 360, 380, 400],
+         [f"{v:,} tonnes" for v in (300000, 320000, 340000, 360000, 380000, 400000)]),
+        (numeric_q(upper_bound=1e5, unit_of_measure="days", **LOG_Q), [730, 760, 790, 820, 850, 880],
+         [f"{v} years" for v in (2, 2.08, 2.16, 2.25, 2.33, 2.41)]),
+        (numeric_q(upper_bound=1e7, unit_of_measure="people", **LOG_Q), [150000, 160000, 170000, 180000, 190000, 200000],
+         [f"{v} ('000s)" for v in (150, 160, 170, 180, 190, 200)]),
+    ],
+)
+def test_g2_log_equivalent_units_not_flagged(question, parsed, written):
+    text = "Reasoning.\n" + "\n".join(f"Percentile {int(p * 100)}: {w}" for p, w in zip(LEVELS, written))
+    assert ng.units_mismatch(pct(parsed), text, question) is None
+
+
+@pytest.mark.parametrize(
+    ("question", "parsed", "written"),
+    [
+        (numeric_q(unit_of_measure="USD"), MILLIONS, [f"${v}M" for v in MILLIONS]),
+        (numeric_q(upper_bound=5e9, unit_of_measure="USD"), MILLIONS, [f"{v}B" for v in MILLIONS]),
+        (numeric_q(upper_bound=1e5), [24, 26, 28, 30, 32, 34], [f"{v}k" for v in (24, 26, 28, 30, 32, 34)]),
+        (numeric_q(upper_bound=1e7, unit_of_measure="people", **LOG_Q), MILLIONS, [f"{v}M" for v in MILLIONS]),
+    ],
+)
+def test_g2_single_letter_slips_flagged(question, parsed, written):
+    text = "Reasoning.\n" + "\n".join(f"Percentile {int(p * 100)}: {w}" for p, w in zip(LEVELS, written))
+    assert ng.units_mismatch(pct(parsed), text, question)
 
 
 @pytest.mark.parametrize(

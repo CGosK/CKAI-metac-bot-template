@@ -12,11 +12,15 @@ percentage parsed as a fraction). Each written value is turned into the
 question's unit in every way it could be meant: magnitude words applied and
 divided by a magnitude the unit carries ("300 thousand" on a "thousand people"
 question is 300), a bare number read both as written and in the unit's
-magnitude ("$300,000" on a "million $" question may be 0.3), a single-letter
-"m" or "K" also read as metres or kelvin. A level is flagged only if every
-reading differs from the parser's by 100x or more, the reading sits inside the
-range (25% slack), and, on linear questions, the parser's value sits in the
-outer 1% of the range. The forecast is flagged when at least 3 levels are found
+magnitude ("$300,000" on a "million $" question may be 0.3), and a single
+letter also read as the unit itself when the question's unit names it ("5 m"
+on a metres question). A level is flagged only if every reading differs from
+the parser's by 100x or more and the reading sits inside the range (25% slack),
+and then: on linear questions, the parser's value sits in the outer 1% of the
+range; on log-scaled questions, the parser returned the written number with its
+magnitude word dropped (or a written percentage divided by 100), the slip's own
+signature, so an equivalent unit the reader doesn't know ("12.5 GW" on an MW
+question) never flags. The forecast is flagged when at least 3 levels are found
 in both and at least half of them are flagged. Round 7's 672 saved forecasts:
 none flagged.
 
@@ -125,10 +129,10 @@ _WORD_MAGNITUDE = {
 _LETTER_MAGNITUDE = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
 _PERCENTILE_LINE = re.compile(
     r"percentile\s*(\d{1,2})\s*[*_]*\s*[:=]\s*[*_]*\s*[~≈]?\s*(?P<sign>[-−])?\s*[$€£]?\s*"
-    r"(?P<num>(?>\d[\d,]*(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(?![\d.])"
-    r"(?:\s*(?P<mag>thousand|million|billion|trillion|mn|mm|bn|tn|k|m|b|t)(?![a-z]))?"
-    r"\s*(?P<pct>%)?"
-    r"(?P<range>\s*(?:to|-|–|—)\s*[$€£]?\d)?",
+    r"(?P<num>(?>\d[\d,]*(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(?!\d|\.\d)"
+    r"(?:[ \t]*(?P<mag>thousand|million|billion|trillion|mn|mm|bn|tn|k|m|b|t)(?![a-z]))?"
+    r"[ \t]*(?P<pct>%)?"
+    r"(?P<range>[ \t]*(?:to|-|–|—)[ \t]*[$€£]?\d)?",
     re.IGNORECASE,
 )
 # Magnitudes carried by a question's unit: words ("thousand people", "Millions of USD", "bn") or a
@@ -141,7 +145,8 @@ _UNIT_LETTER = re.compile(
 
 
 class Reading(NamedTuple):
-    """One "Percentile NN:" value as written: the signed number, its magnitude word (if any) and %."""
+    """One "Percentile NN:" value as written: the signed number, its magnitude word as written (if any)
+    and whether it carried %."""
 
     number: float
     word: str | None
@@ -163,7 +168,7 @@ def read_declared_percentiles(text: str) -> dict[int, Reading]:
             continue
         if m.group("sign"):
             number = -number
-        word = m.group("mag").lower() if m.group("mag") else None
+        word = m.group("mag") or None
         found[int(m.group(1))] = Reading(number, word, bool(m.group("pct")))
     return found
 
@@ -182,12 +187,23 @@ def unit_magnitude(unit: str | None) -> float:
     return 1.0
 
 
-def _candidates(reading: Reading, unit_mag: float, small_range: bool) -> list[float]:
+# A single letter after a number is read as the unit itself (not a magnitude) only when the question's
+# unit names that unit: "5 m" on a metres question, "300 K" on kelvin, "5 t" on tonnes, "8 b" on bytes.
+_LITERAL_LETTER_UNITS = {
+    "m": re.compile(r"^\s*m\s*$|\bmet(?:re|er)s?\b", re.IGNORECASE),
+    "k": re.compile(r"^\s*k\s*$|\bkelvin\b", re.IGNORECASE),
+    "t": re.compile(r"^\s*t\s*$|\btonnes?\b|\btons?\b", re.IGNORECASE),
+    "b": re.compile(r"^\s*b\s*$|\bbytes?\b", re.IGNORECASE),
+}
+
+
+def _candidates(reading: Reading, unit_mag: float, small_range: bool, unit: str | None) -> list[float]:
     """What the forecaster's written value could mean in the question's unit."""
     values = []
     if reading.word:
-        values.append(reading.number * _WORD_MAGNITUDE[reading.word] / unit_mag)
-        if len(reading.word) == 1:  # "5 m" may be metres, "300 K" kelvin
+        word = reading.word.lower()
+        values.append(reading.number * _WORD_MAGNITUDE[word] / unit_mag)
+        if len(word) == 1 and unit and _LITERAL_LETTER_UNITS[word].search(unit):
             values.append(reading.number)
     else:
         values.append(reading.number)
@@ -227,11 +243,22 @@ def _level_mismatch(parsed: float, read: float, lower: float, upper: float, zero
     parsed_position = _position(parsed, lower, upper, zero_point)
     read_plausible = -SLACK <= read_position <= 1 + SLACK
     if zero_point is not None:
-        # Log-scaled: a slip of 1000x still lands inside the range in log terms, so position can't
-        # tell it apart; the 100x gap and a plausible written value decide.
+        # Log-scaled: a 1000x slip still lands inside the range in log terms, so position can't tell
+        # it apart. units_mismatch requires the slip's own signature there instead.
         return read_plausible
     parsed_at_edge = parsed_position < EDGE or parsed_position > 1 - EDGE
     return read_plausible and parsed_at_edge
+
+
+def _slip_signature(parsed: float, reading: Reading) -> bool:
+    """The parser returned the written number with its magnitude word dropped, or a written
+    percentage divided by 100: the shape of a units slip. An unknown but equivalent unit
+    ("12.5 GW" on an MW question) never has it."""
+    def near(a: float, b: float) -> bool:
+        return b != 0 and abs(a - b) <= 0.01 * abs(b)
+    if reading.word and near(parsed, reading.number):
+        return True
+    return reading.percent and near(parsed, reading.number / 100)
 
 
 def units_mismatch(parsed: Sequence[Percentile], text: str, question) -> str | None:
@@ -244,7 +271,8 @@ def units_mismatch(parsed: Sequence[Percentile], text: str, question) -> str | N
         return None
     lower, upper = _bounds(question)
     zero_point = getattr(question, "zero_point", None)
-    unit_mag = unit_magnitude(getattr(question, "unit_of_measure", None))
+    unit = getattr(question, "unit_of_measure", None)
+    unit_mag = unit_magnitude(unit)
     small_range = max(abs(lower), abs(upper)) <= 1.5
     checked = flagged = 0
     examples = []
@@ -254,8 +282,10 @@ def units_mismatch(parsed: Sequence[Percentile], text: str, question) -> str | N
             continue
         reading = readings[level]
         checked += 1
+        if zero_point is not None and not _slip_signature(p.value, reading):
+            continue  # log-scaled: only the slip's own signature can flag a level
         if all(_level_mismatch(p.value, c, lower, upper, zero_point)
-               for c in _candidates(reading, unit_mag, small_range)):
+               for c in _candidates(reading, unit_mag, small_range, unit)):
             flagged += 1
             written = f"{reading.number:g}{' ' + reading.word if reading.word else ''}{'%' if reading.percent else ''}"
             examples.append(f"p{level}: parsed {p.value:g}, written {written}")
