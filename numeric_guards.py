@@ -130,7 +130,7 @@ _LETTER_MAGNITUDE = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}
 _PERCENTILE_LINE = re.compile(
     r"percentile\s*(\d{1,2})\s*[*_]*\s*[:=]\s*[*_]*\s*[~≈]?\s*(?P<sign>[-−])?\s*[$€£]?\s*"
     r"(?P<num>(?>\d[\d,]*(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?)(?!\d|\.\d)"
-    r"(?:[ \t]*(?P<mag>thousand|million|billion|trillion|mn|mm|bn|tn|k|m|b|t)(?![a-z]))?"
+    r"(?:[ \t]*(?P<mag>thousand|million|billion|trillion|mn|mm|bn|tn|k|m|b|t)(?![a-z\u00b2\u00b3/]))?"
     r"[ \t]*(?P<pct>%)?"
     r"(?P<range>[ \t]*(?:to|-|–|—)[ \t]*[$€£]?\d)?",
     re.IGNORECASE,

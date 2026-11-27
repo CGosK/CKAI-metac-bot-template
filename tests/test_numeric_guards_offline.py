@@ -265,6 +265,9 @@ def test_read_declared_percentiles_line_ends():
     assert got[10] == ng.Reading(5.0, None, False)  # a full stop ending the sentence
     assert got[20] == ng.Reading(80.0, None, False)  # a word on the next line isn't a magnitude
     assert got[40] == ng.Reading(90.0, None, False)  # a list on the next line isn't a range
+    units = ng.read_declared_percentiles("Percentile 10: 5 m\u00b2\nPercentile 20: 7 m/s\nPercentile 40: 9 km")
+    assert units[10] == ng.Reading(5.0, None, False) and units[20] == ng.Reading(7.0, None, False)
+    assert units[40] == ng.Reading(9.0, None, False)  # area, speed and km aren't magnitudes
 
 
 @pytest.mark.parametrize(("unit", "magnitude"), [
