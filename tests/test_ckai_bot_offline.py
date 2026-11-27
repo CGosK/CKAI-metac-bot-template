@@ -67,14 +67,15 @@ def _install_fakes(monkeypatch):
         model = re.search(r"model-[abc]", text_to_structure).group(0)
         if output_type is BinaryPrediction:
             return BinaryPrediction(prediction_in_decimal=BINARY_BY_MODEL[model])
+        options = [
+            PredictedOption(option_name="Red", probability=0.5),
+            PredictedOption(option_name="Blue", probability=0.3),
+            PredictedOption(option_name="Green", probability=0.2),
+        ]
         if output_type is PredictedOptionList:
-            return PredictedOptionList(
-                predicted_options=[
-                    PredictedOption(option_name="Red", probability=0.5),
-                    PredictedOption(option_name="Blue", probability=0.3),
-                    PredictedOption(option_name="Green", probability=0.2),
-                ]
-            )
+            return PredictedOptionList(predicted_options=options)
+        if output_type == list[PredictedOption]:  # CkaiBot's guard G1 parses without the sum check
+            return options
         if output_type == list[Percentile]:
             return [
                 Percentile(percentile=p, value=v)

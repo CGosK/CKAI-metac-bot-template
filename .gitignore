@@ -180,3 +180,6 @@ forecast_reports/
 backtest/data/
 backtest/runs/
 backtest/out/
+
+# Claude Code agent worktrees (local only)
+.claude/worktrees/

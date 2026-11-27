@@ -94,6 +94,7 @@ from claude_cli_llm import (  # noqa: E402
     kill_running_calls,
     refuse_in_ci,
 )
+import numeric_guards  # noqa: E402
 import wiki_research  # noqa: E402
 from main import FallTemplateBot2026  # noqa: E402
 
@@ -618,6 +619,107 @@ class CkaiBot(FallTemplateBot2026):
         if self._reverse_binary:
             prompt = reverse_wrap(prompt)
         return await super()._binary_prompt_to_forecast(question, prompt)
+
+    # ---- Guards G1 and G2 (numeric_guards.py; benchmarks/PLAN-numeric-guards.md) ----
+    # Both overrides repeat the template's (main.py) forecaster call and parsing
+    # instructions word for word; tests/test_numeric_guards_offline.py pins them to
+    # the template so a template update that changes them fails a test.
+
+    async def _multiple_choice_prompt_to_forecast(self, question, prompt: str):
+        import main
+        from forecasting_tools import PredictedOption, clean_indents
+
+        parsing_instructions = clean_indents(
+            f"""
+            Make sure that all option names are one of the following:
+            {question.options}
+
+            The text you are parsing may prepend these options with some variation of "Option" which you should remove if not part of the option names I just gave you.
+            Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
+            {self._create_resolved_question_parsing_message()}
+            """
+        )
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+
+        async def parse(instructions: str) -> list[PredictedOption]:
+            return await main.structure_output(
+                text_to_structure=reasoning,
+                output_type=list[PredictedOption],
+                model=self.get_llm("parser", "llm"),
+                num_validation_samples=self._structure_output_validation_samples,
+                additional_instructions=instructions,
+            )
+
+        parsed = await parse(parsing_instructions)
+        try:
+            predicted_option_list, rescaled_from = numeric_guards.build_option_list(parsed, question.options)
+        except ValueError as exc:
+            # The template's sum check used to trigger the parser's retries; give one re-parse instead.
+            logger.warning(f"Guard G1: {question.page_url}: {exc}; re-parsing.")
+            parsed = await parse(
+                parsing_instructions + "\n" + numeric_guards.mc_reparse_instructions(question.options)
+            )
+            predicted_option_list, rescaled_from = numeric_guards.build_option_list(parsed, question.options)
+        if rescaled_from is not None:
+            logger.warning(
+                f"Guard G1: option probabilities for {question.page_url} summed to {rescaled_from:.3f}; rescaled to 1."
+            )
+        logger.info(f"Forecasted URL {question.page_url} with prediction: {predicted_option_list}.")
+        return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
+
+    def _numeric_parsing_instructions(self, question) -> str:
+        from forecasting_tools import clean_indents
+
+        return clean_indents(
+            f"""
+            The text given to you is trying to give a forecast distribution for a numeric question.
+            - This text is trying to answer the numeric question: "{question.question_text}".
+            {self._create_single_distribution_parsing_message(question)}
+            {self._create_resolved_question_parsing_message()}
+            - When parsing the text, please make sure to give the values (the ones assigned to percentiles) in terms of the correct units.
+            - The units for the forecast are: {question.unit_of_measure}
+            - Your work will be shown publicly with these units stated verbatim after the numbers your parse.
+            - As an example, someone else guessed that the answer will be between {question.lower_bound} {question.unit_of_measure} and {question.upper_bound} {question.unit_of_measure}, so the numbers parsed from an answer like this would be verbatim "{question.lower_bound}" and "{question.upper_bound}".
+            - If the answer doesn't give the answer in the correct units, you should parse it in the right units. For instance if the answer gives numbers as $500,000,000 and units are "B $" then you should parse the answer as 0.5 (since $500,000,000 is $0.5 billion).
+            - If percentiles are not explicitly given (e.g. only a single value is given) please don't return a parsed output, but rather indicate that the answer is not explicitly given in the text.
+            - Turn any values that are in scientific notation into regular numbers.
+            """
+        )
+
+    async def _numeric_prompt_to_forecast(self, question, prompt: str):
+        import main
+        from forecasting_tools import NumericDistribution, Percentile
+
+        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
+        parsing_instructions = self._numeric_parsing_instructions(question)
+
+        async def parse(instructions: str) -> list[Percentile]:
+            return await main.structure_output(
+                reasoning,
+                list[Percentile],
+                model=self.get_llm("parser", "llm"),
+                additional_instructions=instructions,
+                num_validation_samples=self._structure_output_validation_samples,
+            )
+
+        percentile_list = await parse(parsing_instructions)
+        problem = numeric_guards.units_mismatch(percentile_list, reasoning, question)
+        if problem:
+            logger.warning(f"Guard G2: units mismatch suspected for {question.page_url}: {problem}; re-parsing.")
+            percentile_list = await parse(
+                parsing_instructions + "\n" + numeric_guards.reparse_instructions(question)
+            )
+            problem = numeric_guards.units_mismatch(percentile_list, reasoning, question)
+            if problem:
+                raise ValueError(f"Guard G2: units mismatch suspected for {question.page_url}: {problem}")
+            logger.warning(f"Guard G2: the re-parse for {question.page_url} fixed the units.")
+        prediction = NumericDistribution.from_question(percentile_list, question)
+        logger.info(
+            f"Forecasted URL {question.page_url} with prediction: {prediction.declared_percentiles}."
+        )
+        return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
     def _pick_forecaster(self) -> GeneralLlm | None:
         if not self._forecasters:
